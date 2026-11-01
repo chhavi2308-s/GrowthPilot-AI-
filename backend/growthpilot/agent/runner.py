@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from .. import audit, usage
 from ..config import get_settings
-from ..llm import LLMError, LLMUnavailable, get_llm
+from ..llm import LLMError, LLMUnavailable, get_llm, provider_of
 from ..models import (
     AgentRun,
     AgentStep,
@@ -38,6 +38,8 @@ from .planner_llm import LLMPlanner
 from .registry import ROLE_LABELS, Role, ToolBlocked, ToolContext, ToolError, ToolResult, get_tool
 
 log = logging.getLogger(__name__)
+
+RULES_PREFIX = "rules:"  # live run on the fixed step plan; the rest of the name is the LLM writing the text
 
 MAX_RETRIES = 2
 PLANNER_RETRY_WAITS = (10, 20, 40, 60)  # seconds; long enough for per-minute rate limits to reset
@@ -99,7 +101,8 @@ def create_run(db: Session, *, workspace_id: int, user_id: int | None, goal: str
                               .limit(1)).scalar_one_or_none()
     if s.is_live:
         llm = get_llm()  # raises LLMUnavailable with a clear message
-        planner = llm.name
+        # Rules-led: the fixed step plan, with the LLM writing the text (fits Groq's free-tier token limits).
+        planner = (RULES_PREFIX + llm.name if s.uses_rules_planner else llm.name)[:40]
     else:
         planner = DemoPlanner.name
     intent, params = parse_goal(goal)
@@ -125,10 +128,10 @@ class Runner:
             role = m.role if m else "viewer"
         self.ctx = ToolContext(db=db, run=run, workspace_id=run.workspace_id, brand_id=run.brand_id,
                                settings=get_settings(), user_role=role)
-        if run.planner == DemoPlanner.name:
+        if run.planner == DemoPlanner.name or run.planner.startswith(RULES_PREFIX):
             self.planner = DemoPlanner()
         else:
-            llm = get_llm()
+            llm = get_llm(provider_of(run.planner))  # resume on the provider the run started with
             if llm is None:
                 raise LLMUnavailable("This run needs an LLM but the app is in demo mode.")
             self.planner = LLMPlanner(llm)
@@ -182,6 +185,16 @@ class Runner:
                                 run_budget_usd=self.run.cost_budget_usd,
                                 approved_extra_usd=float(st.get("approved_extra_usd", 0.0)))
 
+    def _rollback(self, scope: usage.UsageScope) -> None:
+        """Undo a failed attempt's work but keep what it really spent: usage records and the run's totals."""
+        self.db.rollback()
+        usage.restore(scope)
+        self._count(scope)
+
+    def _count(self, scope: usage.UsageScope) -> None:
+        self.run.tokens_used += scope.tokens
+        self.run.cost_usd = round((self.run.cost_usd or 0.0) + scope.cost_usd, 6)
+
     # ── tool execution ───────────────────────────────────────────────────
     def execute(self, action: Action) -> tuple[str, ToolResult | None, str]:
         try:
@@ -206,18 +219,18 @@ class Runner:
                 result = tool.fn(self.ctx, inp)
                 self.db.flush()
             except usage.BudgetExceeded as exc:
-                self.db.rollback()
+                self._rollback(scope)
                 return self._blocked(tool, inp, attempt, t0, meta, str(exc), "budget",
                                      budget={"scope": exc.scope, "needed_usd": exc.needed_usd,
                                              "budget_usd": exc.budget_usd, "spent_usd": exc.spent_usd})
             except usage.QuotaExceeded as exc:
-                self.db.rollback()
+                self._rollback(scope)
                 return self._blocked(tool, inp, attempt, t0, meta, str(exc), "search_quota")
             except ToolBlocked as exc:
-                self.db.rollback()
+                self._rollback(scope)
                 return self._blocked(tool, inp, attempt, t0, meta, str(exc), exc.blocker)
             except (ToolError, LLMError) as exc:
-                self.db.rollback()
+                self._rollback(scope)
                 ms = int((time.monotonic() - t0) * 1000)
                 retry = getattr(exc, "retryable", False) and attempt <= MAX_RETRIES
                 self.step("tool", f"{'Retrying after error' if retry else 'Error'}: {exc}", tool=tool.name,
@@ -227,7 +240,7 @@ class Runner:
                     continue
                 return "error", None, str(exc)
             except Exception as exc:  # noqa: BLE001
-                self.db.rollback()
+                self._rollback(scope)
                 log.exception("tool %s crashed", tool.name)
                 self.step("tool", f"Unexpected error in {tool.name}: {type(exc).__name__}", tool=tool.name,
                           inp=inp.model_dump(mode="json"), status="error", attempt=attempt, **meta)
@@ -297,7 +310,7 @@ class Runner:
             try:
                 res = self.planner.next(self.ctx)
             except usage.BudgetExceeded as exc:
-                self.db.rollback()
+                self._rollback(scope)
                 self.ctx.remember("budget_block", {"scope": exc.scope, "needed_usd": exc.needed_usd,
                                                    "budget_usd": exc.budget_usd, "spent_usd": exc.spent_usd,
                                                    "tool": "planner", "message": str(exc)})
@@ -306,7 +319,7 @@ class Runner:
             except LLMError as exc:
                 if exc.retryable and planner_retries < PLANNER_RETRIES:
                     # Rate limits, overloaded models and network blips usually clear within a minute.
-                    self.db.rollback()
+                    self._rollback(scope)
                     planner_retries += 1
                     wait = PLANNER_RETRY_WAITS[planner_retries - 1]
                     self.step("decision", f"The planner model is unavailable right now ({exc}). Waiting {wait}s, then "
@@ -319,7 +332,7 @@ class Runner:
                 if (exc.retryable and not planner_fallback_attempted and fallback_model and
                         self.ctx.settings.active_llm_provider == "gemini" and current_llm is not None and
                         fallback_model != getattr(current_llm, "model", None)):
-                    self.db.rollback()
+                    self._rollback(scope)
                     fallback = _gemini_fallback(self.ctx.settings, fallback_model)
                     self.planner.llm = fallback
                     self.planner.name = fallback.name
@@ -327,6 +340,7 @@ class Runner:
                     self.step("decision", f"Primary planner model retries were exhausted; trying fallback model "
                               f"{fallback.name} once.", status="error")
                     continue
+                self._count(scope)
                 self._finish(RunStatus.FAILED, "llm_error", f"The planner model failed: {exc}")
                 return
             finally:

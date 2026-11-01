@@ -1,7 +1,7 @@
 """LLM provider interface.
 
-Two providers are implemented behind one interface: Google Gemini (Interactions API) and Anthropic Claude
-(Messages API). Demo mode uses no LLM at all. Every call goes through ``usage.preflight`` (budget check) and
+Three providers are implemented behind one interface: Groq (OpenAI-compatible Chat Completions), Google Gemini
+(Interactions API) and Anthropic Claude (Messages API). Demo mode uses no LLM at all. Every call goes through ``usage.preflight`` (budget check) and
 ``usage.record`` (cost estimate), so the orchestrator never needs provider-specific code.
 
 The conversation format used by the agent planner is provider-neutral and Anthropic-shaped:
@@ -54,14 +54,38 @@ def set_llm_override(llm: LLM | None) -> None:
     _override = llm
 
 
-def get_llm() -> LLM | None:
-    """The configured LLM, or None in demo mode. Raises LLMUnavailable in live mode without a key."""
+# The provider part of an LLM's ``name`` (and so of a run's ``planner``) → the provider key in settings.
+_NAME_PREFIXES = {"groq": "groq", "gemini": "gemini", "claude": "anthropic"}
+
+
+def provider_of(planner: str | None) -> str | None:
+    """The provider a run was started with, from its stored planner name (None for the demo planner)."""
+    head = (planner or "").removeprefix("rules:").split(":", 1)[0]
+    return _NAME_PREFIXES.get(head)
+
+
+def get_llm(provider: str | None = None) -> LLM | None:
+    """The configured LLM, or None in demo mode. Raises LLMUnavailable in live mode without a key.
+
+    ``provider`` pins a specific provider (a resumed run keeps the provider it started with) instead of the one
+    the current settings would pick."""
     if _override is not None:
         return _override
     s = get_settings()
     if s.is_demo:
         return None
-    provider = s.active_llm_provider
+    if provider:
+        key = {"groq": s.groq_api_key, "gemini": s.gemini_api_key, "anthropic": s.llm_key}.get(provider)
+        if not key:
+            raise LLMUnavailable(f"This run was started with {provider}, which is no longer configured. Restore its "
+                                 "API key, or start a new run.")
+    else:
+        provider = s.active_llm_provider
+    if provider == "groq":
+        from .groq_llm import GroqLLM
+
+        return GroqLLM(api_key=s.groq_api_key, model=s.groq_model, reasoning_effort=s.groq_reasoning_effort,
+                       free_tier=s.groq_tier == "free")
     if provider == "gemini":
         from .gemini_llm import GeminiLLM
 
@@ -70,7 +94,8 @@ def get_llm() -> LLM | None:
         from .anthropic_llm import AnthropicLLM
 
         return AnthropicLLM(api_key=s.llm_key, model=s.llm_model, effort=s.llm_effort)
-    raise LLMUnavailable("No LLM configured. Set GEMINI_API_KEY (or LLM_API_KEY for Anthropic) in .env and restart.")
+    raise LLMUnavailable("No LLM configured. Set GROQ_API_KEY (or GEMINI_API_KEY, or LLM_API_KEY for Anthropic) in "
+                         ".env and restart.")
 
 
 def strip_provider_fields(messages: list[dict]) -> list[dict]:

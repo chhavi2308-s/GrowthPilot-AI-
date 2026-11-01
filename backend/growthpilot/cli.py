@@ -62,7 +62,7 @@ def cmd_init_env(args) -> None:
     if target.exists() and not args.force:
         print(f"{target} already exists; leaving it unchanged (use --force to overwrite).")
         return
-    example = (PROJECT_ROOT / ".env.example").read_text()
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
     lines = []
     for line in example.splitlines():
         if line.startswith("SECRET_KEY="):
@@ -70,7 +70,7 @@ def cmd_init_env(args) -> None:
         elif line.startswith("ENCRYPTION_KEY="):
             line = f"ENCRYPTION_KEY={Fernet.generate_key().decode()}"
         lines.append(line)
-    target.write_text("\n".join(lines) + "\n")
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     target.chmod(0o600)
     print(f"Wrote {target} with new SECRET_KEY and ENCRYPTION_KEY (values not shown). Add API keys there when you "
           "have them.")
@@ -115,7 +115,7 @@ def cmd_demo_setup(args) -> None:
           f"#{result['history_campaign_id']}).")
     if password:
         cred = PROJECT_ROOT / "data" / "demo-login.txt"
-        cred.write_text(f"email: {args.email}\npassword: {password}\n")
+        cred.write_text(f"email: {args.email}\npassword: {password}\n", encoding="utf-8")
         cred.chmod(0o600)
         print(f"Demo login created for {args.email}. Password saved to {cred} (local, gitignored).")
     else:

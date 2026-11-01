@@ -12,6 +12,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 
+import httpx
 from sqlalchemy import func, select
 
 from .. import usage
@@ -88,7 +89,8 @@ def search(query: str, *, count: int = 8, country: str | None = None, freshness:
         _check_caps(sc)
         usage.preflight(usage.unit_cost("brave:web_search"), "A web search")
     try:
-        with client(headers={"Accept": "application/json", "X-Subscription-Token": s.brave_key}) as c:
+        with client(timeout=_timeout(), headers={"Accept": "application/json",
+                                                 "X-Subscription-Token": s.brave_key}) as c:
             resp = c.get(ENDPOINT, params=params)
     except Exception as exc:  # noqa: BLE001
         raise SearchError(f"Search request failed: {type(exc).__name__}", retryable=True) from exc
@@ -156,7 +158,8 @@ def search_many(queries: list[str], *, count: int = 5, country: str | None = "IN
             out[q] = exc
 
     def fetch(params: dict):
-        with client(headers={"Accept": "application/json", "X-Subscription-Token": s.brave_key}) as c:
+        with client(timeout=_timeout(), headers={"Accept": "application/json",
+                                                 "X-Subscription-Token": s.brave_key}) as c:
             return c.get(ENDPOINT, params=params)
 
     with ThreadPoolExecutor(max_workers=min(4, max(1, len(allowed)))) as pool:
@@ -169,6 +172,10 @@ def search_many(queries: list[str], *, count: int = 5, country: str | None = "IN
             out[q] = exc if isinstance(exc, SearchError) else SearchError(f"Search request failed: {type(exc).__name__}",
                                                                            retryable=True)
     return {q: out[q] for q in dict.fromkeys(queries)}
+
+
+def _timeout() -> httpx.Timeout:
+    return httpx.Timeout(float(get_settings().search_timeout_seconds), connect=5.0)
 
 
 def _params(query: str, count: int, country: str | None, freshness: str | None) -> dict:

@@ -74,6 +74,7 @@ class CreativeInput:
     palette: Palette = field(default_factory=Palette)
     photo: bytes | None = None  # real product photo (the caller guarantees provenance)
     background: bytes | None = None  # AI-generated background (labelled on the image)
+    background_strength: float = 0.4  # how much of the AI background shows through the brand colour (0–1)
     logo: bytes | None = None
     variation: int = 0
     slide: tuple[int, int] | None = None  # (index, total) for carousel slides
@@ -276,7 +277,7 @@ def render(inp: CreativeInput) -> RenderResult:
     base = Image.new("RGB", (W, H), rgb(col["bg"]))
     if inp.background:
         bg = _cover(Image.open(io.BytesIO(inp.background)), W, H).filter(ImageFilter.GaussianBlur(1))
-        base = Image.blend(bg, Image.new("RGB", (W, H), rgb(col["bg"])), 0.6)
+        base = Image.blend(bg, Image.new("RGB", (W, H), rgb(col["bg"])), 1 - max(0.0, min(1.0, inp.background_strength)))
         notes.append("AI-generated background (labelled on the image).")
     d = ImageDraw.Draw(base)
     draw_border(d, W, H, _mix(col["bg"], col["accent"], 0.7), inset=int(m * 0.45))

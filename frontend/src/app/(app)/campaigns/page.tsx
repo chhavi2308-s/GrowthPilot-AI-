@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useCan } from "@/components/auth";
+import { GenerateCampaignButton } from "@/components/campaign-generation";
 import { SyntheticBadge } from "@/components/domain";
 import { Alert, Badge, Button, Empty, Field, Input, Loading, Modal, PageHeader, Textarea, useAction, useApi } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -23,7 +24,7 @@ export default function CampaignsPage() {
   return (
     <div>
       <PageHeader title="Campaigns" subtitle="Track multi-platform campaign progress, content and dates."
-        actions={can.edit && <><Link href="/agent" className="rounded-xl bg-accent px-4 py-3 text-sm font-semibold text-accent-ink">Plan with the agent</Link><Button onClick={() => setOpen(true)}>+ New campaign</Button></>} />
+        actions={can.edit && <><GenerateCampaignButton /><Link href="/agent" className="rounded-xl bg-accent px-4 py-3 text-sm font-semibold text-accent-ink">Plan with the agent</Link><Button onClick={() => setOpen(true)}>+ New campaign</Button></>} />
       {loading && !data ? <Loading /> : error ? <Alert tone="bad">{error}</Alert> : !data?.length ? <Empty title="No campaigns yet" /> : (
         <div className="grid gap-5 md:grid-cols-2">
           {data.map((c) => {

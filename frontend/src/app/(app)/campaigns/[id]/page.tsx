@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCan } from "@/components/auth";
+import { GenerationPanel } from "@/components/campaign-generation";
 import { ContentTile } from "@/components/content-tile";
 import { ContentStatusBadge, EvidenceBadge, Money, PlatformChip, SourceLink, SyntheticBadge } from "@/components/domain";
 import { Alert, Badge, Button, Card, KeyValue, Loading, PageHeader, useAction, useApi } from "@/components/ui";
@@ -47,6 +48,7 @@ export default function CampaignDetail() {
           {c.run_id && <Link href={`/agent/${c.run_id}`} className="rounded-lg border border-line px-3.5 py-2 text-sm font-semibold hover:bg-panel-2">View agent run</Link>}
         </>} />
       {rep.error && <div className="mb-3"><Alert tone="bad">{rep.error}</Alert></div>}
+      <GenerationPanel campaignId={c.id} />
 
       <div className="mb-5 grid gap-3 md:grid-cols-4">
         <Card><div className="text-xs font-semibold uppercase text-muted">Objective metric</div><div className="mt-1 font-semibold">{(c.objective_metric || "engagement_rate_by_reach").replace(/_/g, " ")}</div>

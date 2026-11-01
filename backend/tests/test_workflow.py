@@ -184,3 +184,58 @@ def test_live_kill_switch_blocks_scheduling(monkeypatch, tmp_path):
     assert r.status_code == 200, r.text
     r = api.post(f"/api/content/{item['id']}/schedule", json={"connection_id": conn_id, "confirm": True})
     assert r.status_code == 400 and "LIVE_PUBLISHING_ENABLED" in r.json()["message"]
+
+
+def test_owner_can_authorise_publishing_after_approval(monkeypatch, tmp_path):
+    """Approved before a live account was connected (so no authorisation was given): the owner can authorise that
+    exact version later instead of sending it back, and any edit removes the authorisation again."""
+    api = Api(make_client(monkeypatch, tmp_path, "live", WEBHOOK_TEST="1", ALLOW_INSECURE_WEBHOOKS="true",
+                          LIVE_PUBLISHING_ENABLED="true"))
+    api.register()
+    api.put("/api/brand", json={"name": "Live Brand", "location": "Bengaluru"})
+    api.post("/api/products", json={"sku": "S1", "name": "Kabini 3-Seater Sofa", "category": "sofa", "price": "78500"})
+    item = _attach_photo(api, _new_item(api)["id"])
+    cid = item["id"]
+    api.post(f"/api/content/{cid}/submit")
+    item = api.get(f"/api/content/{cid}").json()
+    # Nothing to schedule yet: approved without the authorisation box.
+    r = api.post(f"/api/content/{cid}/authorize-publish", json={"version": item["version"]})
+    assert r.status_code == 400 and "approved" in r.json()["message"]
+    r = api.post(f"/api/content/{cid}/approve", json={"version": item["version"], "acknowledge_warnings": True})
+    assert r.status_code == 200 and r.json()["publish_authorized"] is False
+    conn_id = api.post("/api/connections/webhook", json={"name": "Hook", "url": "https://hooks.example.com/x"}
+                       ).json()["connection"]["id"]
+    with session_scope() as db:
+        db.get(ChannelConnection, conn_id).status = "connected"
+    r = api.post(f"/api/content/{cid}/schedule", json={"connection_id": conn_id, "confirm": True})
+    assert r.status_code == 400 and "Authorise publishing" in r.json()["message"]
+    # Only the current approved version can be authorised.
+    r = api.post(f"/api/content/{cid}/authorize-publish", json={"version": item["version"] + 1})
+    assert r.status_code == 400
+    r = api.post(f"/api/content/{cid}/authorize-publish", json={"version": item["version"]})
+    assert r.status_code == 200 and r.json()["publish_authorized"] is True
+    r = api.post(f"/api/content/{cid}/schedule", json={"connection_id": conn_id, "confirm": True})
+    assert r.status_code == 200, r.text
+    # Editing (after unscheduling) clears both the approval and the authorisation.
+    api.post(f"/api/content/{cid}/unschedule")
+    edited = api.put(f"/api/content/{cid}", json={"caption": "A brighter corner with the Kabini 3-Seater Sofa."}).json()
+    assert edited["publish_authorized"] is False and edited["approved_version"] is None
+    r = api.post(f"/api/content/{cid}/authorize-publish", json={"version": edited["version"]})
+    assert r.status_code == 400
+
+
+def test_only_owners_can_authorise_publishing(monkeypatch, tmp_path):
+    owner = Api(make_client(monkeypatch, tmp_path))
+    owner.register()
+    owner.post("/api/demo/reset", json={"confirm": "RESET"})
+    item = _attach_photo(owner, _new_item(owner)["id"])
+    owner.post(f"/api/content/{item['id']}/submit")
+    item = owner.get(f"/api/content/{item['id']}").json()
+    assert owner.post(f"/api/content/{item['id']}/approve", json={"version": item["version"],
+                                                                  "acknowledge_warnings": True}).status_code == 200
+    link = owner.post("/api/settings/invites", json={"email": "ed@example.com", "role": "editor"}).json()["link"]
+    owner.post("/api/auth/logout")
+    editor = Api(owner.c)
+    editor.register(email="ed@example.com", name="Editor", invite=link.split("invite=")[1])
+    r = editor.post(f"/api/content/{item['id']}/authorize-publish", json={"version": item["version"]})
+    assert r.status_code == 403

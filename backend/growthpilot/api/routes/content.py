@@ -549,6 +549,19 @@ def approve(cid: int, body: ApproveIn, ctx: Ctx = Depends(get_ctx)):
     return _detail(ctx, item)
 
 
+class AuthorizeIn(BaseModel):
+    version: int
+
+
+@router.post("/content/{cid}/authorize-publish")
+def authorize_publish(cid: int, body: AuthorizeIn, ctx: Ctx = Depends(get_ctx)):
+    item = ctx.get(ContentItem, cid)
+    _guard(lambda: workflow.authorize_publish(ctx.db, item, user_id=ctx.user.id, role=ctx.role,
+                                              version=body.version, ip=ctx.ip))
+    ctx.db.commit()
+    return _detail(ctx, item)
+
+
 class NoteIn(BaseModel):
     note: str = Field(default="", max_length=2000)
 

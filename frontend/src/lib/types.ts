@@ -669,3 +669,61 @@ export interface UsageSummary {
   recent: { provider: string; operation: string; model: string; run_id: string | null; input_tokens: number; output_tokens: number; units: number; cost_usd: number; cached: boolean; created_at: string }[];
   runs: { id: string; goal: string; status: string; cost_usd: number; budget_usd: number; tokens: number; created_at: string }[];
 }
+
+// ── campaign generation (research → strategy → captions → one image per day) ──
+export type GenerationStatus = "queued" | "running" | "completed" | "partial" | "failed";
+export type GenerationStage = "research" | "strategy" | "text" | "images" | "done";
+export type DayStatus = "pending" | "generating" | "completed" | "failed";
+
+export interface ResearchSource { id: string; title: string; url: string; snippet?: string; age?: string | null; query: string; cached?: boolean }
+
+export interface GenerationDay {
+  day: number;
+  status: DayStatus;
+  attempts: number;
+  error: string;
+  image_prompt: { subject?: string; style?: string; composition?: string; palette?: string; negative?: string; prompt?: string; visual_style?: string } | null;
+  asset: Asset | null;
+  ai_asset: Asset | null;
+  content: {
+    id: number; status: ContentStatus; version: number; approved_version: number | null; title: string; hook: string;
+    caption: string; hashtags: string[]; cta: string; planned_at: string | null; review_note: string;
+    validation_failures: number | null; validation_warnings: number | null;
+  } | null;
+}
+
+export interface CampaignGeneration {
+  id: number;
+  campaign_id: number;
+  brand_id: number;
+  goal: string;
+  days: number;
+  platform: string;
+  aspect_ratio: string;
+  status: GenerationStatus;
+  stage: GenerationStage;
+  error: string;
+  image_mode: "ai" | "local";
+  image_model: string;
+  budget_usd: number;
+  created_at: string;
+  updated_at: string;
+  research: {
+    status?: string; mode?: string; queries?: string[]; sources?: ResearchSource[]; errors?: { query: string; error: string }[];
+    assumptions?: string[]; searched_at?: string; storage_rights?: boolean; questions: { question: string; query: string }[];
+  };
+  strategy: {
+    title: string; objective: string; audience: string; theme: string; voice: string; positioning: string; platforms: string[];
+    product_ids: number[]; findings: { finding: string; source_ids: string[] }[]; assumptions: string[];
+    days: { day: number; objective: string; concept: string; caption_brief: string; cta: string; product_ids: number[]; source_ids: string[] }[];
+  } | null;
+  day_items: GenerationDay[];
+  usage: { brave_requests: number; brave_cached: number; llm_requests: number; llm_tokens: number; image_requests: number; images_generated: number; cost_usd: number };
+  result?: { approved_days: number[]; skipped: { day: number; reason: string }[] };
+}
+
+export interface GenerationEstimate {
+  days: number; image_mode: "ai" | "local"; image_model: string; image_size: string; brave_requests: number; llm_requests: number;
+  image_requests: number; max_image_requests: number; price_per_image_usd: number; expected_cost_usd: number; max_cost_usd: number;
+  budget_usd: number; within_budget: boolean; brands: { id: number; name: string }[];
+}

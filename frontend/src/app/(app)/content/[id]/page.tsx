@@ -499,7 +499,14 @@ function Editor({ item, setData }: { item: ContentItem; setData: (i: ContentItem
                     </label>
                   )}
                   {liveTarget && !integ.data?.live_publishing_enabled && <Alert tone="warn">Live publishing is turned off (LIVE_PUBLISHING_ENABLED=false).</Alert>}
-                  {liveTarget && !item.publish_authorized && <Alert tone="warn">This version was approved without publish authorisation.</Alert>}
+                  {liveTarget && !item.publish_authorized && (
+                    <Alert tone="warn">
+                      v{item.version} was approved without authorising publishing to real accounts.
+                      <Button size="sm" className="ml-2" busy={act.busy}
+                        onClick={() => { if (confirm(`Authorise publishing v${item.version} to real accounts? Any edit will need approval and authorisation again.`)) void doAct(() => api.post<ContentItem>(`/api/content/${id}/authorize-publish`, { version: item.version })); }}>
+                        Authorise publishing v{item.version}</Button>
+                    </Alert>
+                  )}
                   <Button variant="primary" className="mt-2" busy={act.busy} disabled={liveTarget && !sched.confirm}
                     onClick={() => doAct(() => api.post<ContentItem>(`/api/content/${id}/schedule`, { connection_id: Number(sched.connection_id), when: sched.when || null, confirm: sched.confirm }))}>Schedule</Button>
                 </>}

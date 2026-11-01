@@ -108,6 +108,7 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
         brand,
         campaigns,
         content,
+        generation,
         governance,
         integrations,
         overview,
@@ -115,7 +116,7 @@ def create_app(settings: Settings | None = None, *, start_worker: bool | None = 
     )
     from .routes import settings as settings_routes
 
-    for module in (auth, overview, brand, research, agent, campaigns, content, integrations, analytics,
+    for module in (auth, overview, brand, research, agent, campaigns, generation, content, integrations, analytics,
                    governance, settings_routes):
         app.include_router(module.router)
     return app

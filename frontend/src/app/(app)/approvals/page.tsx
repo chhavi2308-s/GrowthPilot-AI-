@@ -82,9 +82,9 @@ function VersionPanel({ item, mode, liveEnabled, onDone }: { item: ContentItem; 
               <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} className="mt-1" />
                 I&apos;ve reviewed the {warnings.length} warning(s) above.</label>
             )}
-            {mode === "live" && hasLiveTarget && (
+            {mode === "live" && (
               <label className="flex items-start gap-2 text-sm text-bad"><input type="checkbox" checked={authorize} onChange={(e) => setAuthorize(e.target.checked)} className="mt-1" />
-                Also authorise publishing this exact version (v{item.version}) to the real account. {liveEnabled ? "" : "(Live publishing is currently off.)"}</label>
+                Also authorise publishing this exact version (v{item.version}) to the real account. {hasLiveTarget ? "" : "(No live account is connected yet; this applies once one is.) "}{liveEnabled ? "" : "(Live publishing is currently off.)"}</label>
             )}
             {act.error && <Alert tone="bad">{act.error}</Alert>}
             <div className="flex flex-wrap gap-2">

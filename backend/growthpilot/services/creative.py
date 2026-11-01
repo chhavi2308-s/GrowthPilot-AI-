@@ -98,10 +98,14 @@ def _clean(text: str, limit: int) -> str:
 def render_for_item(db: Session, item: ContentItem, *, platform: str | None = None, template: str | None = None,
                     variation: int = 0, ai_background: bool = False, show_price: bool | None = None,
                     slide: tuple[int, int] | None = None, headline: str | None = None,
-                    body: list[str] | None = None) -> Asset:
+                    body: list[str] | None = None, background: tuple[bytes, Asset] | None = None,
+                    size: tuple[int, int] | None = None, background_strength: float = 0.4) -> Asset:
+    """``background``: an already generated AI background and its asset (no new image request is made);
+    ``size``: render at this size instead of the platform format (e.g. the 2K size of that background)."""
     brand = db.get(Brand, item.brand_id)
     sp = SPECS.get(platform or item.platform) or SPECS["instagram"]
     fmt = sp.render
+    width, height = size or (fmt.width, fmt.height)
     prods = [p for p in (db.get(Product, pid) for pid in item.product_ids or []) if usable_for_brand(brand, p)]
     p = prods[0] if prods else None
     tpl = template or ("carousel_slide" if slide else template_for(item))
@@ -130,8 +134,8 @@ def render_for_item(db: Session, item: ContentItem, *, platform: str | None = No
     if claim_fail:
         raise WorkflowError("On-image text fails product checks: " + "; ".join(c["message"] for c in claim_fail[:3]))
 
-    bg_bytes, bg_asset = None, None
-    if ai_background:
+    bg_bytes, bg_asset = background if background else (None, None)
+    if ai_background and not background:
         try:
             bg_bytes, ctype, info = imagegen.generate_background(f"{item.pillar} {badge}".strip() or brand.name,
                                                                  brand.colors or [], fmt.width, fmt.height)
@@ -147,16 +151,17 @@ def render_for_item(db: Session, item: ContentItem, *, platform: str | None = No
             log.info("AI background skipped: %s", exc)
             bg_bytes = None
 
-    inp = CreativeInput(template=tpl, width=fmt.width, height=fmt.height, headline=head, subline=sub, body=lines,
+    inp = CreativeInput(template=tpl, width=width, height=height, headline=head, subline=sub, body=lines,
                         price_text=price, cta=cta, badge=badge, product_name=p.name if p else "",
                         product_category=p.category if p else "", brand_name=brand.name,
                         website=(brand.website or "").replace("https://", "").replace("http://", "").strip("/"),
                         palette=Palette.from_colors(brand.colors), photo=photo[0] if photo else None,
-                        background=bg_bytes, logo=_logo(db, brand), variation=variation, slide=slide, fmt="JPEG")
+                        background=bg_bytes, background_strength=background_strength, logo=_logo(db, brand),
+                        variation=variation, slide=slide, fmt="JPEG")
     res = render(inp)
     key = store().save(res.data, ".jpg")
     meta = {
-        "template": tpl, "platform": sp.key, "format": {"width": fmt.width, "height": fmt.height, "label": fmt.label},
+        "template": tpl, "platform": sp.key, "format": {"width": width, "height": height, "label": fmt.label},
         "variation": variation, "layers": [{"kind": ly.kind, "text": ly.text, "box": ly.box, "size": ly.size,
                                             "color": ly.color, "contrast": ly.contrast} for ly in res.layers],
         "checks": res.checks, "notes": res.notes, "claim_checks": claim_checks,

@@ -6,7 +6,7 @@ import json
 from sqlalchemy import select
 
 from ...catalogue import foreign_store_product
-from ...llm import get_llm
+from ...llm import get_llm, provider_of
 from ...models import Brand, ContentItem, Experiment, Persona, Product, Recommendation
 from ..generation import Generator, get_generator
 from ..registry import ToolBlocked, ToolContext, ToolError
@@ -35,7 +35,7 @@ def snapshot(b: Brand) -> dict:
 
 
 def generator(ctx: ToolContext) -> Generator:
-    return get_generator(get_llm())
+    return get_generator(get_llm(provider_of(ctx.run.planner)))
 
 
 def items(ctx: ToolContext, ids: list[int], *, key: str = "content_ids") -> list[ContentItem]:

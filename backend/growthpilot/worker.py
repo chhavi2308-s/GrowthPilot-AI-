@@ -16,7 +16,7 @@ from .agent.runner import claim_next_run, execute_run, recover_stale
 from .config import get_settings
 from .db import session_factory
 from .models import OAuthState, UserSession, Workspace, utcnow
-from .services import analytics, publishing
+from .services import analytics, campaign_generation, publishing
 from .services.canva_poster_pipeline import process_queued as process_canva_poster_jobs
 
 log = logging.getLogger("growthpilot.worker")
@@ -28,7 +28,7 @@ def notify() -> None:
 
 
 def tick(*, metrics: bool = False) -> dict:
-    stats = {"runs": 0, "published": 0, "metrics": 0, "canva_posters": 0}
+    stats = {"runs": 0, "published": 0, "metrics": 0, "canva_posters": 0, "campaign_units": 0}
     db = session_factory()()
     try:
         while (run := claim_next_run(db)) is not None:
@@ -36,6 +36,7 @@ def tick(*, metrics: bool = False) -> dict:
             stats["runs"] += 1
         stats["published"] = publishing.run_due(db)
         stats["canva_posters"] = process_canva_poster_jobs(db, limit=1)
+        stats["campaign_units"] = campaign_generation.process_queued(db)
         if metrics:
             for ws_id in db.execute(select(Workspace.id)).scalars().all():
                 stats["metrics"] += analytics.collect(db, ws_id)["collected"]
@@ -53,6 +54,7 @@ def recover() -> None:
     try:
         recover_stale(db)
         publishing.recover_stuck(db)
+        campaign_generation.recover_stale(db)
     finally:
         db.close()
 

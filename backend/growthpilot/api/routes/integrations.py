@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
@@ -30,8 +30,12 @@ from ...models import (
     ConnectionStatus,
     ContentItem,
     ContentStatus,
+    Membership,
     OAuthState,
     ProviderCredential,
+    Role,
+    User,
+    Workspace,
     utcnow,
 )
 from ...platforms import ORDER, SPECS
@@ -59,6 +63,24 @@ def _conns(ctx: Ctx) -> list[ChannelConnection]:
                                .order_by(ChannelConnection.id)).scalars())
 
 
+def _oauth_return_origin(request: Request) -> str:
+    """Keep the browser on its logged-in app host after the provider callback."""
+    s = get_settings()
+    origin = request.headers.get("origin", "").rstrip("/")
+    if not origin:
+        if getattr(s.app_env, "value", s.app_env) in {"development", "test"}:
+            return "http://localhost:3000"
+        return s.base_url.rstrip("/")
+    parsed = urlsplit(origin)
+    base = urlsplit(s.base_url)
+    valid_shape = parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username and not parsed.password
+    if not valid_shape or parsed.path or parsed.query or parsed.fragment:
+        return s.base_url.rstrip("/")
+    same_as_base = (parsed.scheme, parsed.netloc) == (base.scheme, base.netloc)
+    local_dev = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+    return origin if same_as_base or local_dev else s.base_url.rstrip("/")
+
+
 def _llm_cards(s) -> list[dict]:
     active = s.active_llm_provider
     def status(configured: bool) -> str:
@@ -66,6 +88,15 @@ def _llm_cards(s) -> list[dict]:
             return ConnectionStatus.DEMO
         return "configured" if configured else ConnectionStatus.NOT_CONFIGURED
     return [
+        {"key": "groq", "group": "ai", "name": "Groq (LLM)", "status": status(bool(s.groq_api_key)),
+         "active": active == "groq", "detail": "Demo planner and generator (no LLM calls)" if s.is_demo else
+         (f"Model {s.groq_model}, {s.groq_tier} tier, "
+          + ("rules-led plan" if s.uses_rules_planner and active == "groq" else "model-led plan")
+          + (" — active" if active == "groq" else " — configured, not active")
+          if s.groq_api_key else "Set GROQ_API_KEY in .env (console.groq.com). The free tier allows about 8,000 "
+          "tokens a minute, so runs use the rules-led plan."), "env": ["GROQ_API_KEY", "GROQ_MODEL", "GROQ_TIER",
+                                                                      "LLM_PROVIDER"],
+         "testable": s.is_live and bool(s.groq_api_key), "maturity": "implemented, tested with a mocked API"},
         {"key": "gemini", "group": "ai", "name": "Google Gemini (LLM)", "status": status(bool(s.gemini_api_key)),
          "active": active == "gemini", "detail": "Demo planner and generator (no LLM calls)" if s.is_demo else
          (f"Model {s.gemini_model}, thinking {s.gemini_thinking_level}" + (" — active" if active == "gemini" else
@@ -106,7 +137,7 @@ def _platform_cards(ctx: Ctx, s, conns: list[ChannelConnection]) -> list[dict]:
             status = ConnectionStatus.DEMO if mine else ConnectionStatus.NOT_CONFIGURED
         elif live is None:
             status = "not_implemented"
-        elif not s.instagram_configured:  # both Meta adapters use the same app credentials
+        elif not (s.instagram_configured if key == "instagram" else bool(s.meta_app_id and s.meta_app_secret)):
             status = ConnectionStatus.NOT_CONFIGURED
         elif not mine:
             status = ConnectionStatus.AWAITING_AUTHORIZATION
@@ -309,6 +340,13 @@ def test_integration(key: str, ctx: Ctx = Depends(get_ctx)):
     if s.is_demo:
         raise ApiError(400, "Demo mode makes no external calls.", "demo")
     rate_limit(f"test:{ctx.workspace.id}:{key}", 10, 3600)
+    if key == "groq":
+        from ...llm.groq_llm import check_key as check_groq
+
+        if not s.groq_api_key:
+            return {"ok": False, "message": "GROQ_API_KEY isn't set."}
+        ok, msg = check_groq(s.groq_api_key, s.groq_model)
+        return {"ok": ok, "message": msg}
     if key == "gemini":
         from ...llm.gemini_llm import check_key
 
@@ -345,44 +383,100 @@ def test_integration(key: str, ctx: Ctx = Depends(get_ctx)):
 
 
 @router.post("/integrations/instagram/start")
+
+
 def instagram_start(ctx: Ctx = Depends(get_ctx)):
     ctx.require_owner()
     s = get_settings()
+
     if s.is_demo:
-        raise ApiError(400, "Demo mode uses the demo Instagram adapter; switch to live mode to connect an account.",
-                       "demo")
+        raise ApiError(
+            400,
+            "Demo mode uses the demo Instagram adapter; switch to live mode to connect an account.",
+            "demo",
+        )
+
     if not s.instagram_configured:
-        raise ApiError(400, "Set META_APP_ID and META_APP_SECRET in .env first.", "not_configured")
+        raise ApiError(
+            400,
+            "Configure INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET for direct Instagram Login, or set META_APP_ID, "
+            "META_APP_SECRET, and META_LOGIN_CONFIG_ID for this app's supported Unified Login.",
+            "not_configured",
+        )
+
     state = new_token(24)
-    ctx.db.add(OAuthState(state_hash=hash_token(state), provider="instagram", workspace_id=ctx.workspace.id,
-                          user_id=ctx.user.id, code_verifier_enc=encrypt_str("-"),
-                          expires_at=utcnow() + timedelta(minutes=10)))
+
+    ctx.db.add(
+        OAuthState(
+            state_hash=hash_token(state),
+            provider="instagram",
+            workspace_id=ctx.workspace.id,
+            user_id=ctx.user.id,
+            code_verifier_enc=encrypt_str(_oauth_return_origin(ctx.request)),
+            expires_at=utcnow() + timedelta(minutes=10),
+        )
+    )
+
     ctx.db.commit()
-    return {"authorize_url": InstagramAdapter().authorize_url(state)}
+
+    return {
+        "authorize_url": InstagramAdapter().authorize_url(state)
+    }
 
 
-def _back(status: str, message: str = "", provider: str = "instagram") -> RedirectResponse:
-    return RedirectResponse(f"/integrations?{provider}={status}&message={quote(message[:300])}", status_code=303)
+
+def _back(status: str, message: str = "", provider: str = "instagram",
+          return_origin: str | None = None) -> RedirectResponse:
+    origin = (return_origin or get_settings().base_url).rstrip("/")
+    return RedirectResponse(f"{origin}/integrations?{provider}={status}&message={quote(message[:300])}",
+                            status_code=303)
+
+
+def _oauth_callback_ctx(provider: str, state: str, db: Session, request: Request) -> tuple[Ctx, str] | None:
+    """Recover owner context from one-time OAuth state, independent of callback cookies."""
+    row = db.execute(select(OAuthState).where(OAuthState.state_hash == hash_token(state or "-"))).scalar_one_or_none()
+    if row is None:
+        return None
+
+    valid = row.provider == provider and row.expires_at > utcnow()
+    encrypted_return_origin = row.code_verifier_enc
+    user = db.get(User, row.user_id) if valid else None
+    workspace = db.get(Workspace, row.workspace_id) if valid else None
+    membership = db.execute(select(Membership).where(
+        Membership.user_id == row.user_id,
+        Membership.workspace_id == row.workspace_id,
+    )).scalar_one_or_none() if valid else None
+    valid = bool(valid and user and user.is_active and workspace and membership and membership.role == Role.OWNER)
+
+    # Consume a matched state even when the attempt is invalid or expired.
+    db.delete(row)
+    db.commit()
+    if not valid:
+        return None
+    try:
+        return_origin = decrypt_str(encrypted_return_origin)
+    except Exception:
+        return_origin = _oauth_return_origin(request)
+    if not return_origin.startswith(("http://", "https://")):
+        return_origin = _oauth_return_origin(request)
+    return Ctx(db=db, user=user, workspace=workspace, role=membership.role, session=None, request=request), return_origin
 
 
 @router.get("/integrations/instagram/callback")
-def instagram_callback(state: str = "", code: str = "", error: str = "", error_description: str = "",
-                       ctx: Ctx = Depends(get_ctx)):
-    row = ctx.db.execute(select(OAuthState).where(OAuthState.state_hash == hash_token(state or "-"))).scalar_one_or_none()
-    valid = (row is not None and row.provider == "instagram" and row.user_id == ctx.user.id
-             and row.workspace_id == ctx.workspace.id and row.expires_at > utcnow())
-    if row is not None:
-        ctx.db.delete(row)  # single use
-        ctx.db.commit()
-    if not valid:
+def instagram_callback(request: Request, state: str = "", code: str = "", error: str = "",
+                       error_description: str = "", db: Session = Depends(get_db)):
+    callback = _oauth_callback_ctx("instagram", state, db, request)
+    if callback is None:
         return _back("error", "Authorisation link expired or invalid. Start again.")
+    ctx, return_origin = callback
     if error or not code:
-        return _back("error", f"Authorisation cancelled: {redact(error_description or error)}")
+        return _back("error", f"Authorisation cancelled: {redact(error_description or error)}",
+                     return_origin=return_origin)
     adapter = InstagramAdapter()
     try:
         creds = adapter.exchange_code(code)
     except AdapterError as exc:
-        return _back("error", f"Token exchange failed: {redact(str(exc))}")
+        return _back("error", f"Token exchange failed: {redact(str(exc))}", return_origin=return_origin)
     conn = ChannelConnection(workspace_id=ctx.workspace.id, adapter="instagram", platform="instagram",
                              name="Instagram", account_id=creds.get("user_id", ""), credentials_enc=encrypt_json(creds),
                              token_expires_at=datetime.fromtimestamp(creds["expires_at"], UTC).replace(tzinfo=None) if creds.get("expires_at") else None,
@@ -400,7 +494,8 @@ def instagram_callback(state: str = "", code: str = "", error: str = "", error_d
     audit.record(ctx.db, "connection.created", workspace_id=ctx.workspace.id, user_id=ctx.user.id,
                  target_type="connection", target_id=conn.id, ip=ctx.ip, adapter="instagram", status=conn.status)
     ctx.db.commit()
-    return _back("connected" if conn.status == ConnectionStatus.CONNECTED else "error", msg)
+    return _back("connected" if conn.status == ConnectionStatus.CONNECTED else "error", msg,
+                 return_origin=return_origin)
 
 
 @router.post("/integrations/facebook/start")
@@ -409,34 +504,31 @@ def facebook_start(ctx: Ctx = Depends(get_ctx)):
     s = get_settings()
     if s.is_demo:
         raise ApiError(400, "Demo mode uses the demo Facebook adapter; switch to live mode to connect a Page.", "demo")
-    if not s.instagram_configured:
+    if not (s.meta_app_id and s.meta_app_secret):
         raise ApiError(400, "Set META_APP_ID and META_APP_SECRET in .env first.", "not_configured")
     state = new_token(24)
     ctx.db.add(OAuthState(state_hash=hash_token(state), provider="facebook", workspace_id=ctx.workspace.id,
-                          user_id=ctx.user.id, code_verifier_enc=encrypt_str("-"),
+                          user_id=ctx.user.id, code_verifier_enc=encrypt_str(_oauth_return_origin(ctx.request)),
                           expires_at=utcnow() + timedelta(minutes=10)))
     ctx.db.commit()
     return {"authorize_url": FacebookPageAdapter().authorize_url(state)}
 
 
 @router.get("/integrations/facebook/callback")
-def facebook_callback(state: str = "", code: str = "", error: str = "", error_description: str = "",
-                      ctx: Ctx = Depends(get_ctx)):
-    row = ctx.db.execute(select(OAuthState).where(OAuthState.state_hash == hash_token(state or "-"))).scalar_one_or_none()
-    valid = (row is not None and row.provider == "facebook" and row.user_id == ctx.user.id
-             and row.workspace_id == ctx.workspace.id and row.expires_at > utcnow())
-    if row is not None:
-        ctx.db.delete(row)
-        ctx.db.commit()
-    if not valid:
+def facebook_callback(request: Request, state: str = "", code: str = "", error: str = "",
+                      error_description: str = "", db: Session = Depends(get_db)):
+    callback = _oauth_callback_ctx("facebook", state, db, request)
+    if callback is None:
         return _back("error", "Authorisation link expired or invalid. Start again.", "facebook")
+    ctx, return_origin = callback
     if error or not code:
-        return _back("error", f"Authorisation cancelled: {redact(error_description or error)}", "facebook")
+        return _back("error", f"Authorisation cancelled: {redact(error_description or error)}", "facebook",
+                     return_origin)
     adapter = FacebookPageAdapter()
     try:
         creds = adapter.exchange_code(code)
     except AdapterError as exc:
-        return _back("error", f"Token exchange failed: {redact(str(exc))}", "facebook")
+        return _back("error", f"Token exchange failed: {redact(str(exc))}", "facebook", return_origin)
     page = creds["pages"][0]
     conn = ChannelConnection(workspace_id=ctx.workspace.id, adapter="facebook", platform="facebook",
                              name="Facebook Page", account_id=page["id"], credentials_enc=encrypt_json(creds),
@@ -455,7 +547,8 @@ def facebook_callback(state: str = "", code: str = "", error: str = "", error_de
     audit.record(ctx.db, "connection.created", workspace_id=ctx.workspace.id, user_id=ctx.user.id,
                  target_type="connection", target_id=conn.id, ip=ctx.ip, adapter="facebook", status=conn.status)
     ctx.db.commit()
-    return _back("connected" if conn.status == ConnectionStatus.CONNECTED else "error", msg, "facebook")
+    return _back("connected" if conn.status == ConnectionStatus.CONNECTED else "error", msg, "facebook",
+                 return_origin)
 
 
 class WebhookIn(BaseModel):

@@ -7,11 +7,12 @@ docs and tested against a mocked API, not yet run with real credentials. **Simul
 |---|---|---|---|---|
 | Google Gemini (LLM) | live | Implemented | `GEMINI_API_KEY` | per token (free tier on some models) |
 | Anthropic Claude (LLM, optional) | live | Implemented | `LLM_API_KEY` | per token |
-| Groq (LLM) | — | Not implemented; no adapter or connection check exists | — | — |
+| Groq (LLM, main) | live | Implemented | `GROQ_API_KEY` | free tier (rate-limited), or per token on the Developer tier |
 | Brave Search | live | Implemented | `BRAVE_SEARCH_API_KEY` | $5 / 1,000 requests after a monthly credit |
 | Poojaloka storefront API (catalogue) | live (demo: snapshot) | Implemented; snapshot fetched for real on 2026-10-24 | nothing | free |
 | Public page fetch (`inspect_website`) | live | Implemented, mocked pages | permitted domains in Brand Brain | free |
 | Gemini image (AI backgrounds) | live, optional | Implemented | `IMAGE_GENERATION_PROVIDER=gemini` | ≈ $0.03 per image |
+| Gemini image, campaign creatives (`gemini-nano-banana-2.1`, 2K, google-genai SDK) | live, optional | Implemented; mocked tests only | `IMAGE_GENERATION_PROVIDER=gemini`, `GEMINI_API_KEY` | $0.0504 per 2K image, no free tier (see `docs/CAMPAIGN_GENERATION.md`) |
 | Instagram (Instagram Login) | live | Implemented, mocked Meta API | Meta app, professional account, public HTTPS | free API |
 | Facebook Pages | live | Implemented, mocked Graph API | same Meta app + Facebook Login for Business, a Page | free API |
 | Canva | — | Not integrated; no Canva API calls are made | — | — |
@@ -26,9 +27,9 @@ show the key. Prices are from the providers' pages on 2026-10-24 and are used on
 
 The checked-in implementation and environment template were inspected without reading or displaying local secret
 values. No live provider connection checks were run in this review, so no account or credential is marked verified.
-Groq and Canva are unavailable in the current application. Canva mentions in the creative brief schema describe a
+Canva is unavailable in the current application. Canva mentions in the creative brief schema describe a
 design brief/export target only; they do not invoke Canva or establish a Canva integration. The available LLM
-adapters are Gemini and Anthropic. Their connection checks are owner-only, live-mode requests and may consume
+adapters are Groq, Gemini and Anthropic. Their connection checks are owner-only, live-mode requests and may consume
 provider quota; run them explicitly from Integrations when that cost is acceptable.
 
 Current official docs were checked on 2026-10-31: Meta's [Instagram API collection](https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api)
@@ -46,7 +47,42 @@ poster renderer remains the implemented poster path; the agent's Canva query is 
 
 ---
 
-## Google Gemini (default LLM)
+## Groq (main LLM)
+
+`backend/growthpilot/llm/groq_llm.py`, built from Groq's docs (checked 2026-11-01) and tested against a mocked API
+(`tests/test_groq.py`). **Not yet run with a real key.**
+
+- **API:** OpenAI-compatible Chat Completions at `https://api.groq.com/openai/v1`, Bearer key. Default model
+  `openai/gpt-oss-120b` (`GROQ_MODEL`), `reasoning_effort` from `GROQ_REASONING_EFFORT` (default `low`).
+- **Tools:** the planner's Anthropic-shaped history is translated to `tool_calls` / `role: "tool"` messages; tool
+  calls come back as `tool_use` blocks. Malformed tool arguments are a retryable error.
+- **Structured output:** `json_schema` with `strict: true`. `strict_schema()` inlines refs, makes every property
+  required, sets `additionalProperties: false` and drops keywords strict mode may reject; Pydantic still validates.
+- **Errors:** 401/403 bad key and 404 unknown model are final. 429 waits `retry-after` once in-process (up to 60 s),
+  then hands a retryable error to the runner (waits 10/20/40/60 s). A daily limit (TPD/RPD, or a wait over 60 s)
+  stops immediately. 413 means a single request exceeds the tokens-per-minute limit.
+- **Usage:** every call is recorded with its tokens. `GROQ_TIER=free` records $0; `developer` uses the prices in
+  `usage.TOKEN_PRICES` (gpt-oss-120b $0.15 / $0.60 per million input / output tokens; confirm on groq.com/pricing).
+- **Connection test:** Integrations → Groq → Test calls `GET /models/{model}`, which uses no tokens.
+- **Selection:** `LLM_PROVIDER=groq`, or `auto` picks Groq whenever `GROQ_API_KEY` is set.
+
+**Fitting the free tier (reported: 30 requests/min, 8,000 tokens/min, 200,000 tokens/day, per organisation).**
+`AGENT_PLANNER=auto` runs Groq's free tier on the **rules-led plan**: the fixed step plan from `planner_demo.py`,
+with Groq only writing text through `structured()`. No tool definitions are sent. The run's planner shows as
+`rules:groq:<model>`. `AGENT_PLANNER=model` (or `GROQ_TIER=developer`) uses model-chosen tools instead, which sends
+all 26 tool definitions (about 5,000 tokens) every turn and does not fit 8,000 tokens a minute.
+
+Tokens per run, measured from request sizes in the mocked "plan a week of Instagram posts" run
+(`test_full_live_campaign_run_on_groq_rules_plan`, 2026-11-01):
+
+| Plan | Requests | Prompt tokens (≈ chars / 4) | Largest request (prompt + 4,096 output cap) |
+|---|---|---|---|
+| Rules-led | 9 | ≈ 14,200 | ≈ 6,600 |
+
+Output and reasoning tokens depend on the real model and aren't in this estimate. **Replace this table with real
+numbers from the first live run** (the run page shows `tokens_used`; usage records hold the per-call split).
+
+## Google Gemini (LLM)
 
 Used by the orchestrator (tool use) and by the Strategy, Creative, Distribution and Analyst roles (structured
 outputs). Implemented with the **Interactions API** over REST, server-side (`backend/growthpilot/llm/gemini_llm.py`),

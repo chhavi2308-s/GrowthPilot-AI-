@@ -685,6 +685,57 @@ class CanvaPosterJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class CampaignGeneration(Base):
+    """A research-driven N-day campaign generated in resumable stages (research → strategy → text → one image per
+    day). Each stage's output is stored before the next starts, so a failure or restart never loses earlier work."""
+    __tablename__ = "campaign_generations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"))
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    goal: Mapped[str] = mapped_column(Text)
+    days: Mapped[int] = mapped_column(Integer, default=5)
+    platform: Mapped[str] = mapped_column(String(20), default=Platform.INSTAGRAM)
+    aspect_ratio: Mapped[str] = mapped_column(String(8), default="4:5")
+    # queued | running (claimed by a worker) | completed | partial (some days failed) | failed (a stage failed)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    stage: Mapped[str] = mapped_column(String(20), default="research")  # research | strategy | text | images | done
+    error: Mapped[str] = mapped_column(Text, default="")
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    research: Mapped[dict | None] = mapped_column(JSON)  # queries, sources (title/url), findings, assumptions
+    strategy: Mapped[dict | None] = mapped_column(JSON)  # the validated N-day plan
+    image_mode: Mapped[str] = mapped_column(String(20), default="ai")  # ai (Gemini 2K + real photo) | local
+    image_model: Mapped[str] = mapped_column(String(80), default="")
+    budget_usd: Mapped[float] = mapped_column(default=0.0)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    day_rows: Mapped[list[CampaignGenerationDay]] = relationship(
+        back_populates="generation", cascade="all, delete-orphan", order_by="CampaignGenerationDay.day")
+
+
+class CampaignGenerationDay(Base):
+    """One day of a generated campaign: its post and the status of its image, which is retried on its own."""
+    __tablename__ = "campaign_generation_days"
+    __table_args__ = (UniqueConstraint("generation_id", "day"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    generation_id: Mapped[int] = mapped_column(ForeignKey("campaign_generations.id", ondelete="CASCADE"), index=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    day: Mapped[int] = mapped_column(Integer)
+    content_id: Mapped[int | None] = mapped_column(ForeignKey("content_items.id", ondelete="SET NULL"))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)  # pending|generating|completed|failed
+    attempts: Mapped[int] = mapped_column(Integer, default=0)  # billable image requests made for this day, in total
+    error: Mapped[str] = mapped_column(Text, default="")
+    image_prompt: Mapped[dict | None] = mapped_column(JSON)
+    ai_asset_id: Mapped[int | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"))
+    asset_id: Mapped[int | None] = mapped_column(ForeignKey("assets.id", ondelete="SET NULL"))  # the final creative
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    generation: Mapped[CampaignGeneration] = relationship(back_populates="day_rows")
+
+
 class PublishAttempt(Base):
     __tablename__ = "publish_attempts"
     __table_args__ = (UniqueConstraint("idempotency_key"),)
@@ -750,7 +801,7 @@ class AgentRun(Base):
     campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id", ondelete="SET NULL"))
     goal: Mapped[str] = mapped_column(Text)
     intent: Mapped[str] = mapped_column(String(30), default="")
-    planner: Mapped[str] = mapped_column(String(40))  # demo-planner | claude:<model>
+    planner: Mapped[str] = mapped_column(String(40))  # demo-planner | <provider>:<model> | rules:<provider>:<model>
     status: Mapped[str] = mapped_column(String(30), default=RunStatus.QUEUED, index=True)
     plan: Mapped[list] = mapped_column(JSON, default=list)  # [{"id","tool","purpose","status"}]
     state: Mapped[dict] = mapped_column(JSON, default=dict)  # working memory (ids of produced records, etc.)

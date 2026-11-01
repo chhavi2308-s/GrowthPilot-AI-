@@ -8,7 +8,7 @@ from growthpilot import config
 from growthpilot.adapters import instagram as ig_mod
 from growthpilot.agent import runner as runner_mod
 from growthpilot.api.deps import reset_rate_limits
-from growthpilot.llm import set_llm_override
+from growthpilot.llm import groq_llm, set_llm_override
 from growthpilot.research import net
 
 PASSWORD = "Sup3rSecret-pass"
@@ -24,7 +24,7 @@ def _configure(monkeypatch, tmp_path, mode: str, **extra):
     monkeypatch.setenv("RUN_WORKER_IN_PROCESS", "false")
     monkeypatch.setenv("BASE_URL", extra.pop("BASE_URL", "http://testserver"))
     for k in ("LLM_API_KEY", "ANTHROPIC_API_KEY", "SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY", "GEMINI_API_KEY",
-              "LLM_PROVIDER", "IMAGE_GENERATION_PROVIDER", "IMAGE_GENERATION_API_KEY", "META_APP_ID",
+              "GROQ_API_KEY", "GROQ_MODEL", "GROQ_TIER", "AGENT_PLANNER", "LLM_PROVIDER", "IMAGE_GENERATION_PROVIDER", "IMAGE_GENERATION_API_KEY", "META_APP_ID",
               "META_APP_SECRET", "LIVE_PUBLISHING_ENABLED", "ALLOW_INSECURE_WEBHOOKS", "DEMO_ALLOW_CATALOGUE_SYNC"):
         monkeypatch.delenv(k, raising=False)
     for k, v in extra.items():
@@ -40,6 +40,7 @@ def _isolation(monkeypatch):
     config.get_settings.cache_clear()
     monkeypatch.setattr(runner_mod, "_sleep", lambda _s: None)
     monkeypatch.setattr(ig_mod, "_sleep", lambda _s: None)
+    monkeypatch.setattr(groq_llm, "_sleep", lambda _s: None)
     yield
     set_llm_override(None)
     net.set_transport(None)

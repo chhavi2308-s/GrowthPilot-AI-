@@ -185,6 +185,24 @@ def approve(db: Session, item: ContentItem, *, user_id: int, role: str, version:
                  publish_authorized=item.publish_authorized, platform=item.platform, approved_hash=item.approved_hash)
 
 
+def authorize_publish(db: Session, item: ContentItem, *, user_id: int, role: str, version: int,
+                      ip: str | None = None) -> None:
+    """Authorise live publishing for an already-approved version (for when the owner didn't tick it at approval,
+    e.g. because no live account was connected yet). Bound to that exact, unchanged version."""
+    require(role, Role.OWNER)
+    if item.status not in (ContentStatus.APPROVED, ContentStatus.FAILED):
+        raise WorkflowError("Only an approved post can be authorised for publishing.")
+    if version != item.version or item.approved_version != item.version:
+        raise WorkflowError(f"You're authorising v{version}, but the approved version is "
+                            f"v{item.approved_version or '-'} and the current one is v{item.version}.")
+    if not approval_intact(db, item):
+        raise WorkflowError("The text or media changed after approval; it needs approval again.")
+    item.publish_authorized = True
+    audit.record(db, "content.publish_authorized", workspace_id=item.workspace_id, user_id=user_id,
+                 target_type="content", target_id=item.id, ip=ip, version=item.version,
+                 approved_hash=item.approved_hash)
+
+
 def request_changes(db: Session, item: ContentItem, *, user_id: int, role: str, note: str,
                     ip: str | None = None) -> None:
     require(role, Role.OWNER)
@@ -268,7 +286,8 @@ def schedule(db: Session, item: ContentItem, connection: ChannelConnection, when
         if not s.live_publishing_enabled:
             raise WorkflowError("Live publishing is turned off (LIVE_PUBLISHING_ENABLED=false).")
         if not item.publish_authorized:
-            raise WorkflowError("An owner must authorise publishing for this exact version when approving it.")
+            raise WorkflowError("An owner must authorise publishing for this exact version first (tick it when "
+                                "approving, or use “Authorise publishing” on the post).")
         if actor == "human" and not confirmed:
             raise WorkflowError("Confirm that this will publish to a real account.")
     item.status = ContentStatus.SCHEDULED

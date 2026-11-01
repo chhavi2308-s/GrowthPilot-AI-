@@ -1,6 +1,6 @@
 """Encrypted workspace-scoped OAuth credentials for Canva MCP."""
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "c92e81f4a073"
 down_revision = "a81d0a6f4a21"

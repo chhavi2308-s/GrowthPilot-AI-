@@ -52,7 +52,7 @@ SITE = "https://poojaloka.com"
 
 
 def load_snapshot() -> dict:
-    return json.loads(SNAPSHOT_PATH.read_text())
+    return json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
 
 
 def _when(snap: dict) -> str:

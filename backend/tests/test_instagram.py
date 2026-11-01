@@ -83,7 +83,7 @@ def _payload(urls=("https://app.example.com/api/public/assets/t.jpg",)):
 
 @pytest.fixture
 def meta(monkeypatch, tmp_path):
-    make_client(monkeypatch, tmp_path, "live", META_APP_ID="123", META_APP_SECRET="shh", BASE_URL="https://app.example.com")
+    make_client(monkeypatch, tmp_path, "live", INSTAGRAM_APP_ID="ig-123", INSTAGRAM_APP_SECRET="ig-shh", META_APP_ID="123", META_APP_SECRET="shh", BASE_URL="https://app.example.com")
     fake = FakeMeta()
     net.set_transport(httpx.MockTransport(fake))
     return fake
@@ -139,7 +139,8 @@ def test_personal_account_rejected(meta):
 
 
 def test_oauth_state_validation_and_connect(monkeypatch, tmp_path):
-    api = Api(make_client(monkeypatch, tmp_path, "live", META_APP_ID="123", META_APP_SECRET="shh",
+    api = Api(make_client(monkeypatch, tmp_path, "live", INSTAGRAM_APP_ID="ig-123", INSTAGRAM_APP_SECRET="ig-shh",
+                          META_APP_ID="123", META_APP_SECRET="shh",
                           BASE_URL="https://app.example.com"))
     api.register()
     fake = FakeMeta()
@@ -149,7 +150,10 @@ def test_oauth_state_validation_and_connect(monkeypatch, tmp_path):
     assert r.status_code == 303 and "instagram=error" in r.headers["location"]
     start = api.post("/api/integrations/instagram/start").json()["authorize_url"]
     q = parse_qs(urlparse(start).query)
+    assert urlparse(start).hostname == "www.instagram.com"
+    assert q["client_id"] == ["ig-123"]
     assert q["scope"] == ["instagram_business_basic,instagram_business_content_publish,instagram_business_manage_insights"]
+    assert q["enable_fb_login"] == ["0"]
     assert q["redirect_uri"] == ["https://app.example.com/api/integrations/instagram/callback"]
     state = q["state"][0]
     r = api.c.get(f"/api/integrations/instagram/callback?state={state}&code=good-code", follow_redirects=False)
@@ -163,10 +167,15 @@ def test_oauth_state_validation_and_connect(monkeypatch, tmp_path):
         assert "LONG" not in (conn.credentials_enc or "")  # encrypted at rest
     listing = api.get("/api/integrations").text
     assert "LONG" not in listing and "SHORT" not in listing
+    facebook_start = api.post("/api/integrations/facebook/start").json()["authorize_url"]
+    facebook_query = parse_qs(urlparse(facebook_start).query)
+    assert urlparse(facebook_start).hostname == "www.facebook.com"
+    assert facebook_query["redirect_uri"] == ["https://app.example.com/api/integrations/facebook/callback"]
 
 
 def test_live_publish_end_to_end_with_mock_meta(monkeypatch, tmp_path):
-    api = Api(make_client(monkeypatch, tmp_path, "live", META_APP_ID="123", META_APP_SECRET="shh",
+    api = Api(make_client(monkeypatch, tmp_path, "live", INSTAGRAM_APP_ID="ig-123", INSTAGRAM_APP_SECRET="ig-shh",
+                          META_APP_ID="123", META_APP_SECRET="shh",
                           BASE_URL="https://app.example.com", LIVE_PUBLISHING_ENABLED="true"))
     api.register()
     api.put("/api/brand", json={"name": "Live Brand", "location": "Bengaluru"})
