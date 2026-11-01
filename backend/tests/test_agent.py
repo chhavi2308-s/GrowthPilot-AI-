@@ -282,6 +282,7 @@ def test_planner_tries_configured_gemini_fallback_once_after_primary_retries(mon
     primary = FlakyLLM([], failures=runner_mod.PLANNER_RETRIES + 1)
 
     class FallbackLLM(FakeLLM):
+        name = "gemini:gemini-test-fallback"
         model = "gemini-test-fallback"
 
     fallback = FallbackLLM([Resp([Block("text", "Planning complete.")], "end_turn")])
