@@ -27,6 +27,7 @@ def _settings(monkeypatch):
         canva_redirect_uri="https://growthpilot.example/api/integrations/canva/callback",
         canva_callback_uri="https://growthpilot.example/api/integrations/canva/callback",
         canva_mcp_url="https://api.canva.com/connect/v1/mcp",
+        canva_mcp_daily_cap=7,
     )
     monkeypatch.setattr(integrations, "get_settings", lambda: settings)
     monkeypatch.setattr(security, "get_settings", lambda: settings)
@@ -240,6 +241,8 @@ def test_workspace_credentials_are_encrypted_and_refresh_lock_is_workspace_scope
     @asynccontextmanager
     async def fake_connected(**kwargs):
         nonlocal active, maximum_active
+        assert isinstance(kwargs["db"], Session)
+        assert kwargs["max_daily_generations"] == 7
         active += 1
         maximum_active = max(maximum_active, active)
         entered.append(kwargs["access_token"])
@@ -339,3 +342,45 @@ def _async_return(value):
         return value
 
     return result
+
+
+def test_public_canva_callback_relays_only_to_configured_app_origin(monkeypatch):
+    from starlette.requests import Request
+
+    settings = _settings(monkeypatch)
+    settings.base_url = "http://localhost:3000"
+    request = Request({"type": "http", "scheme": "https", "method": "GET",
+                       "server": ("growthpilot.example", 443), "path": "/api/integrations/canva/callback",
+                       "query_string": b"code=mock-code&state=mock-state",
+                       "headers": [(b"host", b"growthpilot.example")]})
+    monkeypatch.setattr(integrations, "get_ctx", lambda *_: pytest.fail("Relay must not consume OAuth state"))
+    response = asyncio.run(integrations.canva_oauth_return(request, db=None))
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "http://localhost:3000/api/integrations/canva/callback?code=mock-code&state=mock-state"
+    )
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize("incoming,base", [
+    ("localhost:3000", "http://localhost:3000"),
+    ("attacker.example", "http://localhost:3000"),
+    ("growthpilot.example", "http://insecure.example"),
+    ("growthpilot.example", "https://user:pass@app.example"),
+])
+def test_canva_callback_cannot_bypass_session_or_redirect_to_unsafe_origin(monkeypatch, incoming, base):
+    from starlette.requests import Request
+
+    settings = _settings(monkeypatch)
+    settings.base_url = base
+    request = Request({"type": "http", "scheme": "https", "method": "GET",
+                       "server": (incoming, 443), "path": "/api/integrations/canva/callback",
+                       "query_string": b"", "headers": [(b"host", incoming.encode())]})
+
+    def require_session(*_args):
+        raise RuntimeError("session still required")
+
+    monkeypatch.setattr(integrations, "get_ctx", require_session)
+    with pytest.raises(RuntimeError, match="session still required"):
+        asyncio.run(integrations.canva_oauth_return(request, db=None))

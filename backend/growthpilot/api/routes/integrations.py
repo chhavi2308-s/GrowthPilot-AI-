@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 from ... import audit
 from ...adapters import AdapterError, all_adapters, available_adapters, get_adapter, live_adapter_for
@@ -23,6 +24,7 @@ from ...creative.canva_mcp import (
     pkce_pair,
     safe_canva_message,
 )
+from ...db import get_db
 from ...models import (
     ChannelConnection,
     ConnectionStatus,
@@ -224,6 +226,27 @@ async def canva_connect(ctx: Ctx = Depends(get_ctx)):
 
 
 @router.get("/integrations/canva/callback")
+async def canva_oauth_return(request: Request, state: str = "", code: str = "", error: str = "",
+                             error_description: str = "", db: Session = Depends(get_db)):
+    settings = get_settings()
+    callback = urlparse(settings.canva_callback_uri)
+    base = urlparse(settings.base_url)
+    incoming_host = request.headers.get("x-forwarded-host", request.url.netloc).split(",")[0].strip().casefold()
+    safe_base = (base.scheme == "https" or
+                 (base.scheme == "http" and base.hostname in {"localhost", "127.0.0.1", "::1"}))
+    if (safe_base and base.hostname and not base.username and not base.password
+            and callback.netloc.casefold() == incoming_host
+            and base.netloc.casefold() != incoming_host):
+        # A localhost login cookie cannot accompany Canva's public tunnel return.
+        # Relay only to the configured app origin; the normal callback below still
+        # requires its session and atomically checks user/workspace-bound state.
+        target = f"{base.scheme}://{base.netloc}/api/integrations/canva/callback?{request.url.query}"
+        return RedirectResponse(target, status_code=303,
+                                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+    return await canva_callback(state=state, code=code, error=error, error_description=error_description,
+                                ctx=get_ctx(request, db))
+
+
 async def canva_callback(state: str = "", code: str = "", error: str = "", error_description: str = "",
                          ctx: Ctx = Depends(get_ctx)):
     verifier_enc = ctx.db.execute(delete(OAuthState).where(

@@ -64,6 +64,8 @@ def test_schema_mapping_fails_closed_on_unknown_required_fields():
                     "required": ["candidate_id", "mystery"]}
     with pytest.raises(Exception, match="Unmapped required"):
         _schema_args(Client(), "create-design-from-candidate", {"candidate_id": "candidate"})
+    with pytest.raises(Exception, match="Unmapped required"):
+        _schema_args(Client(), "create-design-from-candidate", {"candidate_id": "candidate", "mystery": None})
 
 
 def test_export_url_discovery_walks_nested_response():
@@ -76,6 +78,83 @@ def test_candidate_choice_uses_returned_score_and_design_id_shape():
     assert _select_candidate(rows) is rows[1]
     assert _select_candidate([{"candidate_id": "first"}, {"candidate_id": "second"}]) == {"candidate_id": "first"}
     assert _design_id({"job": {"id": "job-id", "design": {"id": "design-id"}}}) == "design-id"
+    assert _design_id({"design_summary": {"id": "design-id", "title": "Private draft"}}) == "design-id"
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ({"type": "string", "enum": ["pdf", "png"]}, "png"),
+    ({"type": "object", "properties": {"type": {"type": "string", "enum": ["png", "jpg"]}},
+      "required": ["type"]}, {"type": "png"}),
+])
+def test_png_export_uses_discovered_format_shape(spec, expected):
+    from growthpilot.services.canva_poster_pipeline import _export_args
+
+    class Client:
+        def schema(self, _name):
+            return {"properties": {"design_id": {"type": "string"}, "format": spec},
+                    "required": ["design_id", "format"]}
+
+    assert _export_args(Client(), "design") == {"design_id": "design", "format": expected}
+
+
+def test_export_retry_reuses_committed_design_without_generation_or_quota_write(monkeypatch):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    import httpx
+
+    from growthpilot.models import Brand, ContentItem, ContentStatus
+    from growthpilot.services import canva_poster_pipeline as pipeline
+
+    item = SimpleNamespace(id=3, workspace_id=1, brand_id=2, product_ids=[], status=ContentStatus.DRAFT,
+                           canva_poster={"job_id": 7, "design_id": "existing-design", "image_trust": "none",
+                                         "edit_link_available": True})
+    brand = SimpleNamespace(id=2, workspace_id=1, name="Test brand")
+    job = SimpleNamespace(id=7, content_id=3, workspace_id=1, calls_used=3, status="queued")
+    calls, saved = [], []
+
+    class Db:
+        def get(self, model, _identity):
+            return {ContentItem: item, Brand: brand}[model]
+
+        def commit(self):
+            pass
+
+    class Client:
+        tools = {"export-design": {}}
+
+        def schema(self, _name):
+            return {"properties": {"design_id": {"type": "string"}, "format": {"type": "string"}},
+                    "required": ["design_id", "format"]}
+
+        async def call(self, name, arguments):
+            calls.append((name, arguments))
+            return {"job": {"urls": ["https://download.invalid/preview.png"]}}
+
+    @asynccontextmanager
+    async def connected(*_args):
+        yield Client(), None
+
+    original = httpx.AsyncClient
+    png = b"\x89PNG\r\n\x1a\n" + b"test-image"
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=png)), **kwargs,
+    ))
+    monkeypatch.setattr(pipeline, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(pipeline, "prepare_canva_brief", lambda *_: (SimpleNamespace(), {}))
+    monkeypatch.setattr(pipeline, "connected_workspace_client", connected)
+    monkeypatch.setattr(pipeline, "reserve_daily_generation", lambda *_args, **_kwargs: pytest.fail("No new generation"))
+    monkeypatch.setattr(pipeline, "_overlay_brand_mark", lambda image, *_: image)
+    monkeypatch.setattr(pipeline, "_brand_logo_bytes", lambda *_: None)
+    monkeypatch.setattr(pipeline, "_qa_verdict", lambda *_args, **_kwargs: {"passed": False})
+    monkeypatch.setattr(pipeline, "_persist_poster", lambda *args, **kwargs: saved.append((args, kwargs)))
+
+    asyncio.run(pipeline.process_job(Db(), job))
+    assert calls == [("export-design", {"design_id": "existing-design", "format": "png"})]
+    assert job.calls_used == 3
+    assert saved[0][0][4:6] == (png, "existing-design")
+    assert saved[0][1]["edit_link_available"] is True
 
 
 def test_poster_png_is_persisted_as_workspace_asset_and_invalidates_approval(monkeypatch):

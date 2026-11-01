@@ -274,6 +274,31 @@ def test_planner_waits_and_retries_on_rate_limits(monkeypatch, tmp_path):
         assert run.status == "failed" and run.completion_reason == "llm_error"
 
 
+def test_planner_tries_configured_gemini_fallback_once_after_primary_retries(monkeypatch, tmp_path):
+    api = _live(monkeypatch, tmp_path, LLM_PROVIDER="gemini", GEMINI_API_KEY="test-key",
+                PLANNER_FALLBACK_MODEL="gemini-test-fallback")
+    waits = []
+    monkeypatch.setattr(runner_mod, "_sleep", waits.append)
+    primary = FlakyLLM([], failures=runner_mod.PLANNER_RETRIES + 1)
+
+    class FallbackLLM(FakeLLM):
+        model = "gemini-test-fallback"
+
+    fallback = FallbackLLM([Resp([Block("text", "Planning complete.")], "end_turn")])
+    set_llm_override(primary)
+    monkeypatch.setattr(runner_mod, "_gemini_fallback", lambda _settings, _model: fallback)
+    rid = _run_obj(api, "Plan a simple brand review")
+    with session_scope() as db:
+        run = execute_run(db, db.get(AgentRun, rid))
+        assert run.status == "completed", (run.completion_reason, run.outcome_summary)
+        messages = [step.message for step in run.steps]
+        assert any("gemini-test-fallback" in message for message in messages)
+    assert primary.failures == 0
+    assert len(primary.seen) == 0
+    assert len(fallback.seen) == 1
+    assert waits == list(runner_mod.PLANNER_RETRY_WAITS)
+
+
 def test_live_run_without_llm_key_is_blocked_with_message(monkeypatch, tmp_path):
     api = Api(make_client(monkeypatch, tmp_path, "live"))
     api.register()

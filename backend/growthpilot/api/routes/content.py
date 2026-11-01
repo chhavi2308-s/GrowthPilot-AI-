@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
 from ... import audit, worker
 from ... import catalogue as catalogue_mod
@@ -44,32 +44,101 @@ from .brand import current_brand
 router = APIRouter(prefix="/api", tags=["content"])
 
 
+class CanvaPosterIn(BaseModel):
+    prompt: str | None = Field(default=None, max_length=5000)
+    regenerate: bool = False
+    reference_asset_id: int | None = Field(default=None, gt=0)
+
+
+class CanvaChoiceIn(BaseModel):
+    candidate_id: str = Field(min_length=1, max_length=300)
+    request_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _poster_job_reply(job) -> dict:
+    return {"job_id": job.id, "status": job.status, "calls_used": job.calls_used}
+
+
 @router.post("/content/{cid}/canva-poster", status_code=202)
-def enqueue_canva_poster(cid: int, ctx: Ctx = Depends(get_ctx)):
-    """Validate the saved canonical brief and enqueue one private Canva job."""
+def enqueue_canva_poster(cid: int, ctx: Ctx = Depends(get_ctx), body: CanvaPosterIn | None = None):
+    """Save the user's Image brief and queue options, without choosing a design."""
     from sqlalchemy.exc import IntegrityError
 
-    from ... import worker
     from ...creative.canva_mcp import CanvaMCPError
-    from ...services.canva_poster_pipeline import validate_brief_for_item
+    from ...services.canva_choices import image_prompt, request_key
+    from ...services.canva_poster_pipeline import MAX_JOB_CALLS, prepare_canva_brief
 
     ctx.require_editor()
     rate_limit(f"canva-poster:{ctx.workspace.id}:{ctx.user.id}", 8, 3600)
     item = ctx.get(ContentItem, cid)
+    if getattr(item, "status", ContentStatus.DRAFT) in workflow.FINAL:
+        raise ApiError(400, "This post can no longer be edited.", "workflow")
     brand = ctx.get(Brand, item.brand_id)
-    try:
-        validate_brief_for_item(ctx.db, item, brand)
-    except CanvaMCPError as exc:
-        raise ApiError(400, str(exc), "invalid_brief") from None
     job = ctx.db.execute(select(CanvaPosterJob).where(CanvaPosterJob.workspace_id == ctx.workspace.id,
                                                        CanvaPosterJob.content_id == item.id)).scalar_one_or_none()
-    if job and job.status in {"queued", "generating", "exporting", "completed"}:
-        return {"job_id": job.id, "status": job.status, "calls_used": job.calls_used}
+    if job and job.status in {"queued", "generating", "exporting", "qa"}:
+        if body and body.prompt is not None and body.prompt.strip() != image_prompt(item):
+            raise ApiError(409, "Wait for the current generation before changing the Image brief.", "busy")
+        if (body and "reference_asset_id" in body.model_fields_set and body.reference_asset_id !=
+                (item.canva_poster or {}).get("reference_asset_id")):
+            raise ApiError(409, "Wait for the current generation before changing the reference image.", "busy")
+        return _poster_job_reply(job)
+    original_saved = dict(getattr(item, "canva_poster", None) or {})
+    reference_id = original_saved.get("reference_asset_id")
+    if body and "reference_asset_id" in body.model_fields_set:
+        reference_id = body.reference_asset_id
+    if reference_id:
+        reference = ctx.get(Asset, reference_id)
+        if reference.brand_id not in (None, item.brand_id) or reference.content_type not in {"image/png", "image/jpeg"}:
+            raise ApiError(400, "Choose a PNG or JPEG reference image from this brand's assets.", "invalid_reference")
+    item.canva_poster = {**original_saved, "reference_asset_id": reference_id}
+    if body and body.prompt is not None:
+        if not body.prompt.strip():
+            raise ApiError(400, "Enter an Image brief to generate options.", "invalid_brief")
+        _guard(lambda: workflow.update(ctx.db, item, {"image_brief": body.prompt}, user_id=ctx.user.id,
+                                      role=ctx.role, note="Saved Image brief for Canva options."))
+    try:
+        prepare_canva_brief(ctx.db, item, brand)
+    except CanvaMCPError as exc:
+        raise ApiError(400, str(exc), "invalid_brief") from None
+    saved = getattr(item, "canva_poster", None) or {}
+    key = request_key(item)
+    if (job and job.status in {"awaiting_selection", "completed"} and not (body and body.regenerate)
+            and saved.get("request_key", key) == key):
+        return _poster_job_reply(job)
+    # A failed export can resume the selected design; a changed prompt or an
+    # explicit regenerate request starts fresh options, never silently reuses it.
+    resume = (job and job.status == "failed" and (saved.get("design_id") or saved.get("selected_candidate_id"))
+              and saved.get("request_key", key) == key and not (body and body.regenerate))
+    new_batch = bool(body and body.regenerate) or original_saved.get("request_key", key) != key
+    if job and not resume and not new_batch and job.calls_used >= MAX_JOB_CALLS:
+        raise ApiError(429, "This batch has reached its retry limit. Generate new options to start a fresh batch.",
+                       "generation_limit")
     if job:
-        job.status, job.error = "queued", ""
+        claimed = ctx.db.execute(update(CanvaPosterJob).where(CanvaPosterJob.id == job.id,
+            CanvaPosterJob.workspace_id == ctx.workspace.id, CanvaPosterJob.status == job.status)
+            .values(status="queued", error=""))
+        if claimed.rowcount != 1:
+            ctx.db.rollback()
+            raise ApiError(409, "Another generation or choice already started. Refresh this post.", "busy")
+        if new_batch:
+            job.calls_used = 0
     else:
         job = CanvaPosterJob(content_id=item.id, workspace_id=ctx.workspace.id, status="queued")
         ctx.db.add(job)
+        try:
+            ctx.db.flush()
+        except IntegrityError:
+            ctx.db.rollback()
+            job = ctx.db.execute(select(CanvaPosterJob).where(CanvaPosterJob.content_id == item.id,
+                CanvaPosterJob.workspace_id == ctx.workspace.id)).scalar_one()
+            return _poster_job_reply(job)
+    if not resume:
+        item.canva_poster = {"job_id": job.id, "request_key": key, "prompt": image_prompt(item), "phase": "queued",
+                             "reference_asset_id": reference_id}
+    if getattr(item, "status", ContentStatus.DRAFT) in {ContentStatus.APPROVED, ContentStatus.SCHEDULED}:
+        item.status, item.scheduled_at = ContentStatus.DRAFT, None
+    workflow._clear_approval(item)
     try:
         ctx.db.commit()
     except IntegrityError:
@@ -77,16 +146,57 @@ def enqueue_canva_poster(cid: int, ctx: Ctx = Depends(get_ctx)):
         job = ctx.db.execute(select(CanvaPosterJob).where(CanvaPosterJob.content_id == item.id,
             CanvaPosterJob.workspace_id == ctx.workspace.id)).scalar_one()
     worker.notify()
-    return {"job_id": job.id, "status": job.status, "calls_used": job.calls_used}
+    return _poster_job_reply(job)
+
+
+@router.post("/content/{cid}/canva-poster/select", status_code=202)
+def select_canva_candidate(cid: int, body: CanvaChoiceIn, ctx: Ctx = Depends(get_ctx)):
+    from ...services.canva_choices import request_key
+
+    ctx.require_editor()
+    rate_limit(f"canva-select:{ctx.workspace.id}:{ctx.user.id}", 20, 3600)
+    item = ctx.get(ContentItem, cid)
+    if item.status in workflow.FINAL:
+        raise ApiError(400, "This post can no longer be edited.", "workflow")
+    job = ctx.db.execute(select(CanvaPosterJob).where(CanvaPosterJob.content_id == item.id,
+        CanvaPosterJob.workspace_id == ctx.workspace.id)).scalar_one_or_none()
+    saved = item.canva_poster or {}
+    if (not job or saved.get("job_id") != job.id or saved.get("request_key") != body.request_key
+            or request_key(item) != body.request_key):
+        raise ApiError(409, "These options are out of date. Generate options from your current Image brief.", "stale_options")
+    allowed = {row.get("id") for row in saved.get("candidates", [])}
+    if body.candidate_id not in allowed:
+        raise ApiError(400, "Choose one of this post's generated options.", "invalid_candidate")
+    if (saved.get("selected_candidate_id") == body.candidate_id
+            and job.status in {"queued", "generating", "exporting", "qa", "completed"}):
+        return _poster_job_reply(job)
+    if job.status != "awaiting_selection":
+        raise ApiError(409, "This generation is no longer waiting for a choice.", "busy")
+    claimed = ctx.db.execute(update(CanvaPosterJob).where(CanvaPosterJob.id == job.id,
+        CanvaPosterJob.workspace_id == ctx.workspace.id, CanvaPosterJob.status == "awaiting_selection")
+        .values(status="queued", error=""))
+    if claimed.rowcount != 1:
+        ctx.db.rollback()
+        raise ApiError(409, "An option has already been selected. Refresh this post.", "busy")
+    item.canva_poster = {**saved, "selected_candidate_id": body.candidate_id, "phase": "queued"}
+    workflow._clear_approval(item)
+    ctx.db.commit()
+    worker.notify()
+    return {"job_id": job.id, "status": "queued", "calls_used": job.calls_used}
 
 
 @router.get("/content/{cid}/canva-poster")
 def canva_poster_status(cid: int, ctx: Ctx = Depends(get_ctx)):
+    from ...services.canva_choices import option_previews
+
     item = ctx.get(ContentItem, cid)
     job = ctx.db.execute(select(CanvaPosterJob).where(CanvaPosterJob.content_id == item.id,
         CanvaPosterJob.workspace_id == ctx.workspace.id)).scalar_one_or_none()
+    poster = item.canva_poster
+    if job and isinstance(poster, dict) and poster.get("job_id") == job.id and poster.get("candidates"):
+        poster = option_previews(ctx.workspace.id, job.id, poster)
     return {"job": None if job is None else {"id": job.id, "status": job.status,
-            "calls_used": job.calls_used, "error": job.error}, "poster": item.canva_poster}
+            "calls_used": job.calls_used, "error": job.error}, "poster": poster}
 
 
 @router.get("/content/{cid}/canva-poster/edit-link")

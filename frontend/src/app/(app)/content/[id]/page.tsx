@@ -3,7 +3,7 @@
 import { Download, RefreshCw } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth, useCan } from "@/components/auth";
 import { ContentStatusBadge, EvidenceBadge, PLATFORM_ORDER, PLATFORMS, PlatformChip, SourceLink, SyntheticBadge, ValidationPanel } from "@/components/domain";
 import { PlatformPreview } from "@/components/post-preview";
@@ -141,7 +141,10 @@ type PosterStatus = {
   poster: ContentItem["canva_poster"];
 };
 
-function CanvaPosterPanel({ item, editable, onSaved }: { item: ContentItem; editable: boolean; onSaved: (i: ContentItem) => void }) {
+function CanvaPosterPanel({ item, editable, onSaved, imageBrief, onPromptChange, references }: {
+  item: ContentItem; editable: boolean; onSaved: (i: ContentItem) => void;
+  imageBrief: string; onPromptChange: (prompt: string) => void; references: Asset[];
+}) {
   const path = `/api/content/${item.id}/canva-poster`;
   const posterState = useApi<PosterStatus>(path);
   const connection = useApi<{ status: string; message?: string }>("/api/integrations/canva/status");
@@ -149,14 +152,38 @@ function CanvaPosterPanel({ item, editable, onSaved }: { item: ContentItem; edit
   const fallback = useAction();
   const edit = useAction();
   const [editLink, setEditLink] = useState<string | null>(null);
+  const upload = useAction();
+  const [referenceId, setReferenceId] = useState<number | null>(item.canva_poster?.reference_asset_id || null);
+  const [uploadedReference, setUploadedReference] = useState<Asset | null>(null);
+  const actionError = useRef<HTMLDivElement>(null);
+  const referenceOptions = references.filter((asset) => asset.kind !== "preview" && ["image/png", "image/jpeg"].includes(asset.content_type));
+  if (uploadedReference && !referenceOptions.some((asset) => asset.id === uploadedReference.id)) referenceOptions.unshift(uploadedReference);
+  useEffect(() => {
+    if (act.error) actionError.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [act.error]);
+  const uploadReference = async (file?: File) => {
+    if (!file) return;
+    const result = await upload.run(async () => {
+      if (!["image/png", "image/jpeg"].includes(file.type) || file.size > 8 * 1024 * 1024) {
+        throw new Error("Choose a PNG or JPEG image up to 8 MB.");
+      }
+      const form = new FormData();
+      form.append("file", file);
+      form.append("alt_text", "User-provided reference image for AI design variations.");
+      return api.upload<Asset>("/api/assets", form);
+    });
+    if (result) { setUploadedReference(result); setReferenceId(result.id); }
+  };
   const job = posterState.data?.job;
   const poster = posterState.data?.poster || item.canva_poster;
   const active = !!job && ["queued", "generating", "exporting", "qa"].includes(job.status);
   const connected = connection.data?.status === "connected";
-  const stepNames = ["Queued", "Generating", "Exporting", "QA", "In review"];
-  const stepIndex = job?.status === "queued" ? 0 : job?.status === "generating" ? 1
-    : job?.status === "exporting" ? 2 : job?.status === "qa" ? 3
-      : job?.status === "completed" ? 4 : -1;
+  const choosing = job?.status === "awaiting_selection";
+  const options = poster?.candidates || [];
+  const promptChanged = (poster?.prompt !== undefined && imageBrief.trim() !== poster.prompt.trim()) || (poster?.reference_asset_id || null) !== referenceId;
+  const stepNames = ["Generate options", "Choose a design", "Create design", "Export", "In review"];
+  const stepIndex = choosing ? 1 : job?.status === "exporting" || job?.status === "qa" ? 3
+    : job?.status === "completed" ? 4 : active ? (poster?.selected_candidate_id ? 2 : 0) : -1;
   const imageId = poster?.asset_id || (job?.status === "completed" ? item.asset_id : null);
   const imageUrl = item.assets?.find((asset) => asset.id === imageId)?.url || (imageId ? `/api/assets/${imageId}/file` : null);
 
@@ -172,7 +199,16 @@ function CanvaPosterPanel({ item, editable, onSaved }: { item: ContentItem; edit
   }, [job?.status, imageId, item.asset_id, item.id, onSaved]);
 
   const requestPoster = async () => {
-    const result = await act.run(() => api.post<{ job_id: number; status: string; calls_used: number }>(path, {}));
+    const result = await act.run(() => api.post<{ job_id: number; status: string; calls_used: number }>(path, {
+      prompt: imageBrief, reference_asset_id: referenceId, regenerate: choosing || job?.status === "completed",
+    }));
+    if (result) void posterState.reload();
+  };
+  const chooseOption = async (candidateId: string) => {
+    if (!poster?.request_key) return;
+    const result = await act.run(() => api.post(`${path}/select`, {
+      candidate_id: candidateId, request_key: poster.request_key,
+    }));
     if (result) void posterState.reload();
   };
   const renderFallback = async () => {
@@ -187,7 +223,34 @@ function CanvaPosterPanel({ item, editable, onSaved }: { item: ContentItem; edit
   const canUseRenderer = editable && ["post", "carousel"].includes(item.content_type);
 
   return (
-    <Card title="Canva poster" subtitle="Private design generation; a person must review and approve before publishing.">
+    <Card title="Create images with Canva" subtitle="Describe your image, compare the options, then choose one to create and export.">
+      <Field label="Image brief" hint="Describe the subject, style, colours, layout and any text. No separate AI Workspace brief is needed.">
+        {(fid) => <Textarea id={fid} rows={5} maxLength={5000} value={imageBrief}
+          disabled={!editable || active} onChange={(event) => onPromptChange(event.target.value)}
+          placeholder="For example: A warm, minimal festive poster with gold abstract shapes, cream background and bold lettering. Give me different visual directions." />}
+      </Field>
+      <div className="my-3 rounded-xl border border-line p-3">
+        <Field label="Reference image (optional)" hint="Use an image to guide new AI variations. Describe what to change in the Image brief.">
+          {(fid) => <Select id={fid} value={referenceId || ""} disabled={!editable || active || upload.busy}
+            onChange={(event) => setReferenceId(event.target.value ? Number(event.target.value) : null)}>
+            <option value="">No reference — text to image</option>
+            {referenceOptions.map((asset) => <option key={asset.id} value={asset.id}>{asset.filename}</option>)}
+          </Select>}
+        </Field>
+        <label className={cx("mt-3 inline-flex rounded-lg border border-line px-3 py-2 text-xs font-semibold", active || upload.busy || !editable ? "opacity-50" : "cursor-pointer hover:bg-panel-2")}>
+          {upload.busy ? "Uploading reference…" : "Upload a reference image"}
+          <input type="file" aria-label="Upload a reference image" accept="image/png,image/jpeg" className="sr-only"
+            disabled={!editable || active || upload.busy}
+            onChange={(event) => { void uploadReference(event.target.files?.[0]); event.target.value = ""; }} />
+        </label>
+        {referenceId && <div className="mt-3">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={`/api/assets/${referenceId}/file`} alt="Reference image for Canva variations" className="max-h-40 max-w-full rounded-lg object-contain" />
+          <p className="mt-2 text-xs text-muted">AI may change image details. Generated options require review and are never treated as verified product photos.</p>
+        </div>}
+        {upload.error && <Alert tone="bad">{upload.error}</Alert>}
+      </div>
+      <p className="my-2 text-xs text-muted">Your Image brief is saved when you generate options. AI-generated designs always need human review.</p>
       {connection.loading ? <p className="mb-3 text-sm text-muted">Checking Canva connection…</p> : unavailable ? (
         <Alert tone="warn" title="Canva is unavailable for this workspace">
           {connection.data?.message || connection.error || "Connect Canva to generate editable designs."} {" "}
@@ -213,6 +276,26 @@ function CanvaPosterPanel({ item, editable, onSaved }: { item: ContentItem; edit
           ) : <div className="mt-2 text-xs text-muted">Design ID: {poster?.design_id || "not created"}</div>}
         </div>
       )}
+
+      {choosing && <div className="my-4">
+        <h3 className="mb-2 font-semibold">Choose your favourite design</h3>
+        <p className="mb-3 text-sm text-muted">These are previews. Only the option you choose will be created and exported.</p>
+        {promptChanged && <Alert tone="warn">You changed the Image brief or reference. Generate new options to use your changes.</Alert>}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {options.map((option, index) => <div key={option.id} className="overflow-hidden rounded-xl border border-line bg-panel-2 p-3">
+            {option.preview_asset_id || option.preview_url ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={option.preview_asset_id ? `/api/assets/${option.preview_asset_id}/file` : option.preview_url} referrerPolicy="no-referrer" alt={`Canva design option ${index + 1}`}
+                className="mb-3 aspect-[4/5] w-full rounded-lg bg-panel object-contain" />
+            ) : <div className="mb-3 flex aspect-[4/5] items-center justify-center rounded-lg bg-panel text-sm text-muted">Preview unavailable</div>}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-sm font-semibold">{option.title}</span>
+              <Button busy={act.busy} disabled={!editable || promptChanged || active}
+                onClick={() => chooseOption(option.id)}>Use option {index + 1}</Button>
+            </div>
+          </div>)}
+        </div>
+      </div>}
 
       {imageUrl && <div className="my-3 max-w-sm overflow-hidden rounded-xl border border-line bg-panel-2">
         {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -242,9 +325,10 @@ function CanvaPosterPanel({ item, editable, onSaved }: { item: ContentItem; edit
       )}
 
       {editable && <div className="mt-3 flex flex-wrap gap-2">
-        <Button variant="primary" busy={act.busy} disabled={!connected || active || job?.status === "completed"}
-          onClick={requestPoster}>{job?.status === "failed" ? "Retry Canva poster" : "Generate Canva poster"}</Button>
+        <Button variant="primary" busy={act.busy} disabled={!connected || active || upload.busy || !imageBrief.trim()}
+          onClick={requestPoster}>{job?.status === "failed" && !promptChanged ? "Retry" : choosing || job?.status === "completed" ? "Generate new options" : "Generate options"}</Button>
       </div>}
+      {act.error && <div ref={actionError} role="alert" className="mt-3"><Alert tone="bad">{act.error}</Alert></div>}
       {item.status === "in_review" && <p className="mt-3 text-xs font-semibold text-warn">Human approval is still required before any publishing.</p>}
     </Card>
   );
@@ -338,14 +422,14 @@ function Editor({ item, setData }: { item: ContentItem; setData: (i: ContentItem
                   <option value="">None</option>
                   {library.data?.map((a) => <option key={a.id} value={a.id}>{a.source_label}: {a.filename}</option>)}
                 </Select>)}</Field></div>
-              <div className="md:col-span-2"><Field label="Image brief">{(fid) => <Textarea id={fid} value={draft.image_brief || ""} onChange={(e) => setDraft({ ...draft, image_brief: e.target.value })} />}</Field></div>
               {draft.content_type === "carousel" && <div className="md:col-span-2"><Field label="Carousel outline" hint="one slide per line; re-render to update slides">{() => <ListInput value={draft.carousel_outline || []} onChange={(v) => setDraft({ ...draft, carousel_outline: v })} rows={5} />}</Field></div>}
             </fieldset>
             {item.rationale && <p className="mt-2 text-xs text-muted">Rationale: {item.rationale}</p>}
           </Card>
 
           <CreativePanel item={item} editable={editable} onSaved={setData} />
-          <CanvaPosterPanel item={item} editable={editable} onSaved={setData} />
+          <CanvaPosterPanel item={item} editable={editable} onSaved={setData}
+            imageBrief={draft.image_brief || ""} onPromptChange={(prompt) => setDraft({ ...draft, image_brief: prompt })} references={library.data || []} />
 
           <Card title="Verification" actions={<Button size="sm" busy={act.busy} onClick={async () => { const v = await act.run(() => api.post(`/api/content/${id}/validate`)); if (v) setData({ ...item, validation: v as ContentItem["validation"] }); }}>Re-check</Button>}>
             <ValidationPanel v={item.validation} version={item.version} />

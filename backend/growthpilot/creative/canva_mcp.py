@@ -22,6 +22,10 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 
 MCP_URL = "https://api.canva.com/connect/v1/mcp"
+_PREVIEW_SCOPES = frozenset({
+    "profile:read", "design:meta:read", "design:content:read", "design:content:write",
+    "asset:read", "asset:write",
+})
 
 _CANVA_URL = re.compile(
     r"(?i)https?://[^\s\"'<>]+|(?:www\.)?canva\.com/[^\s\"'<>]+|"
@@ -93,11 +97,13 @@ class SlidingWindowLimiter:
     """Process-local request limiter matching Canva's published minute ceilings."""
 
     def __init__(self) -> None:
-        self._calls: dict[str, deque[float]] = {"generate-design": deque(), "upload": deque()}
+        self._calls: dict[str, deque[float]] = {"generate-design": deque(), "generate-image": deque(), "upload": deque()}
         self._lock = threading.Lock()
 
     async def acquire(self, operation: str) -> None:
-        key, maximum = ("generate-design", 20) if operation == "generate-design" else ("upload", 30)
+        limits = {"generate-design": 20, "generate-image": 10, "upload": 30}
+        key = operation if operation in limits else "upload"
+        maximum = limits[key]
         while True:
             with self._lock:
                 now = time.monotonic()
@@ -114,7 +120,8 @@ class SlidingWindowLimiter:
 _limiter = SlidingWindowLimiter()
 
 
-def reserve_daily_generation(db: Any, *, limit: int = 20, now: datetime | None = None) -> None:
+def reserve_daily_generation(db: Any, *, limit: int = 20, now: datetime | None = None,
+                             operation: str = "generate-design") -> None:
     """Count the attempt before the external call so failures cannot evade the daily cap."""
     from sqlalchemy import select
 
@@ -122,13 +129,15 @@ def reserve_daily_generation(db: Any, *, limit: int = 20, now: datetime | None =
 
     now = now or datetime.now(UTC).replace(tzinfo=None)
     since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if operation not in {"generate-design", "generate-image"}:
+        raise CanvaMCPError("Unsupported Canva generation operation.")
     count = db.execute(select(UsageRecord.id).where(
-        UsageRecord.provider == "canva-mcp", UsageRecord.operation == "generate-design",
+        UsageRecord.provider == "canva-mcp", UsageRecord.operation.in_(["generate-design", "generate-image"]),
         UsageRecord.created_at >= since,
     )).scalars().all()
     if len(count) >= limit:
         raise CanvaMCPError(f"Canva MCP daily generation cap reached ({limit}).")
-    db.add(UsageRecord(provider="canva-mcp", operation="generate-design", model="Canva MCP",
+    db.add(UsageRecord(provider="canva-mcp", operation=operation, model="Canva MCP",
                        units=1, cost_usd=0.0, created_at=now))
     db.flush()
 
@@ -193,10 +202,12 @@ async def oauth_metadata(mcp_url: str = MCP_URL) -> dict[str, Any]:
                 parsed = urlparse(metadata.get(field, ""))
                 if parsed.scheme != "https" or not parsed.netloc:
                     raise CanvaMCPError(f"Canva OAuth metadata omitted a valid HTTPS {field}.")
-            advertised_scopes = metadata.get("scopes_supported")
+            # RFC 9728 resource metadata owns the resource's supported scopes.
+            # Canva's authorization-server document does not advertise them.
+            advertised_scopes = resource.get("scopes_supported") or metadata.get("scopes_supported")
             metadata["required_scopes"] = (
                 scope_match.group(1).split() if scope_match else
-                [scope for scope in advertised_scopes if isinstance(scope, str)]
+                [scope for scope in advertised_scopes if isinstance(scope, str) and scope in _PREVIEW_SCOPES]
                 if isinstance(advertised_scopes, list) else []
             )
             resource_uri = resource.get("resource")
@@ -315,7 +326,8 @@ def _http_status(exc: BaseException) -> int | None:
             if found is not None:
                 return found
     response = getattr(exc, "response", None)
-    value = getattr(response, "status_code", None) or getattr(exc, "status_code", None)
+    value = (getattr(response, "status_code", None) or getattr(exc, "http_status", None)
+             or getattr(exc, "status_code", None))
     return value if isinstance(value, int) else None
 
 
@@ -339,12 +351,13 @@ async def connected_client(*, access_token: str, refresh_token: str, client_id: 
             ) from exc
     client = CanvaMCPClient(access_token, timeout=timeout, db=db, mcp_url=mcp_url,
                             max_daily_generations=max_daily_generations)
+    client._diagnostic_secrets = (refresh_token, client_secret)
     try:
         await client.__aenter__()
     except Exception as exc:
+        await _close_partial(client)
         if _http_status(exc) != 401 or refreshed:
             raise CanvaMCPError.from_exception("Canva MCP connection failed", exc) from exc
-        await _close_partial(client)
         try:
             access_token, refresh_token = await refresh_mcp_tokens(
                 client_id=client_id, client_secret=client_secret, refresh_token=refresh_token,
@@ -356,6 +369,7 @@ async def connected_client(*, access_token: str, refresh_token: str, client_id: 
             ) from refresh_exc
         client = CanvaMCPClient(access_token, timeout=timeout, db=db, mcp_url=mcp_url,
                                 max_daily_generations=max_daily_generations)
+        client._diagnostic_secrets = (refresh_token, client_secret)
         try:
             await client.__aenter__()
         except Exception as retry_exc:
@@ -410,6 +424,8 @@ async def connected_workspace_client(db: Any, workspace_id: int, settings: Any):
             client_secret=settings.canva_client_secret,
             persist_tokens=persist,
             mcp_url=settings.canva_mcp_url,
+            db=db,
+            max_daily_generations=getattr(settings, "canva_mcp_daily_cap", 10),
         ) as client:
             yield client, row
 
@@ -431,28 +447,36 @@ def json_value(value: Any) -> Any:
     return value
 
 
-def _redact_error(value: Any) -> Any:
+def _redact_error(value: Any, *, secrets: tuple[str, ...] = ()) -> Any:
     value = redact_canva_urls(value)
     sensitive = re.compile(r"token|secret|authorization|upload.?url|code|verifier", re.I)
     if isinstance(value, dict):
-        return {str(key): "[REDACTED]" if sensitive.search(str(key)) else _redact_error(item)
+        return {str(key): "[REDACTED]" if sensitive.search(str(key)) else _redact_error(item, secrets=secrets)
                 for key, item in value.items()}
     if isinstance(value, list):
-        return [_redact_error(item) for item in value]
+        return [_redact_error(item, secrets=secrets) for item in value]
     if isinstance(value, str):
-        value = re.sub(r"(?i)bearer\s+\S+", "Bearer [REDACTED]", value)
-        value = re.sub(r"(?i)(access.?token|refresh.?token|client.?secret|authorization|upload.?url|code_verifier)"
-                       r"\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", value)
+        value = re.sub(r"(?i)bearer\s+[^\s\"',;]+", "Bearer [REDACTED]", value)
+        # Handle JSON (including quoted values containing spaces), form fields,
+        # and a truncated final field before applying any output length limit.
+        field = r"(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|authorization|code|code_verifier|upload.?url)"
+        value = re.sub(
+            rf'''(?ix)(["']?{field}["']?\s*[:=]\s*)("(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;}}]+)''',
+            r'\1"[REDACTED]"', value,
+        )
         value = re.sub(r"(https://[^\s?]+)\?[^\s]+", r"\1?[REDACTED]", value)
         value = re.sub(r"\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
                        "[REDACTED_JWT]", value)
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[REDACTED]")
         return value[:1200]
     return value
 
 
-def safe_canva_message(value: Any) -> str:
+def safe_canva_message(value: Any, *, secrets: tuple[str, ...] = ()) -> str:
     """Return a display-safe Canva error without tokens, codes, or signed URLs."""
-    safe = _redact_error(value)
+    safe = _redact_error(value, secrets=secrets)
     return safe if isinstance(safe, str) else json.dumps(safe, ensure_ascii=True, default=str)[:1200]
 
 
@@ -485,8 +509,57 @@ class CanvaMCPClient:
         self._sdk_v2 = False
         self._transport_owned_by_session = False
         self._tools: dict[str, Any] = {}
+        self._transport_error: CanvaMCPError | None = None
+        self._diagnostic_secrets: tuple[str, ...] = ()
+
+    async def _capture_response(self, response: Any) -> None:
+        """Capture failed MCP POSTs before the SDK discards HTTP diagnostics.
+
+        Successful/SSE responses and optional background GETs remain streaming.
+        Only a bounded, sanitized error body is made available to the SDK, too,
+        so a JSON-RPC error cannot reintroduce secrets through SDK logging.
+        """
+        if response.request.method != "POST" or 200 <= response.status_code < 300:
+            return
+        chunks = bytearray()
+        limit = 8192
+        truncated = False
+        try:
+            async for chunk in response.aiter_bytes(chunk_size=1024):
+                remaining = limit - len(chunks)
+                chunks.extend(chunk[:remaining])
+                if len(chunks) >= limit:
+                    truncated = True
+                    break
+        except Exception:
+            # Never stringify read failures: they can include request credentials.
+            truncated = True
+        finally:
+            await response.aclose()
+        raw = chunks.decode("utf-8", errors="replace")
+        safe = safe_canva_message(raw, secrets=(self._token, *self._diagnostic_secrets))
+        if truncated:
+            safe = safe[:1100] + " [body truncated or unavailable]"
+        # Both supported httpx versions cache read bodies in _content. The stream
+        # is closed above; replay only the safe, bounded bytes to the SDK.
+        response._content = safe.encode("utf-8")
+        status = response.status_code
+        self._transport_error = CanvaMCPError(
+            f"Canva MCP transport failed: HTTP {status}: {safe or '(empty body)'}",
+            http_status=status, exception_type="HTTPStatusError", redacted_message=safe,
+        )
+
+    def _connection_error(self, message: str, exc: BaseException) -> CanvaMCPError:
+        return CanvaMCPError.from_exception(message, self._transport_error or exc)
 
     async def __aenter__(self) -> CanvaMCPClient:
+        self._transport_error = None
+        try:
+            return await self._connect()
+        except Exception as exc:
+            raise self._connection_error("Canva MCP connection failed", exc) from None
+
+    async def _connect(self) -> CanvaMCPClient:
         try:
             import httpx2
             from mcp import Client
@@ -495,11 +568,16 @@ class CanvaMCPClient:
             self._sdk_v2 = True
             self._http_client = httpx2.AsyncClient(
                 timeout=self._timeout, headers={"Authorization": f"Bearer {self._token}"},
+                event_hooks={"response": [self._capture_response]},
             )
             self._transport_context = streamable_http_client(self._mcp_url, http_client=self._http_client)
             # Client owns and enters the transport context; entering it separately breaks
             # AnyIO's task-group lifetime on Windows.
-            self._session_context = Client(self._transport_context)
+            # Use Canva's supported initialize handshake directly rather than
+            # sending the SDK v2 server/discover probe first.
+            self._session_context = Client(
+                self._transport_context, mode="legacy", read_timeout_seconds=self._timeout,
+            )
             self._transport_owned_by_session = True
             self._session = await self._session_context.__aenter__()
         except ImportError as exc:
@@ -508,8 +586,17 @@ class CanvaMCPClient:
                 from mcp.client.streamable_http import streamablehttp_client
             except ImportError:
                 raise CanvaMCPError("The official Python MCP SDK is unavailable in this runtime.") from exc
+
+            def http_client_factory(**kwargs):
+                import httpx
+
+                hooks = kwargs.setdefault("event_hooks", {})
+                hooks.setdefault("response", []).append(self._capture_response)
+                return httpx.AsyncClient(**kwargs)
+
             self._transport_context = streamablehttp_client(
                 self._mcp_url, headers={"Authorization": f"Bearer {self._token}"}, timeout=self._timeout,
+                httpx_client_factory=http_client_factory,
             )
             read_stream, write_stream, _ = await self._transport_context.__aenter__()
             self._session_context = ClientSession(read_stream, write_stream)
@@ -528,6 +615,7 @@ class CanvaMCPClient:
         if self._http_client is not None:
             await self._http_client.aclose()
         self._token = ""
+        self._diagnostic_secrets = ()
 
     @property
     def tools(self) -> dict[str, Any]:
@@ -562,10 +650,13 @@ class CanvaMCPClient:
             await _limiter.acquire("generate-design")
         elif name in {"create-upload-url", "upload-asset-from-url"}:
             await _limiter.acquire("upload")
+        elif name == "generate-image":
+            await _limiter.acquire("generate-image")
+        self._transport_error = None
         try:
             result = await self._session.call_tool(name, arguments)
         except Exception as exc:  # SDK exceptions may contain request headers; do not stringify them.
-            raise CanvaMCPError.from_exception(f"Canva MCP {name} call failed", exc) from exc
+            raise self._connection_error(f"Canva MCP {name} call failed", exc) from None
         payload = json_value(getattr(result, "structuredContent", None)
                              or getattr(result, "structured_content", None))
         if payload is None:
@@ -585,6 +676,8 @@ class CanvaMCPClient:
         job_id = job.get("job_id") or job.get("jobId") or job.get("id") or _nested(payload, "job_id", "jobId")
         if not isinstance(job_id, str):
             return payload
+        if _candidate_rows(payload):
+            return {**payload, "job_id": job_id}
         start = time.monotonic()
         continuation = _nested(payload, "continuation_token", "continuationToken")
         while time.monotonic() - start < max_seconds:
@@ -599,7 +692,9 @@ class CanvaMCPClient:
             payload = await self.call(name, args)
             continuation = _nested(payload, "continuation_token", "continuationToken") or continuation
             if _candidate_rows(payload):
-                return payload
+                # Candidate-list responses can omit the generation job id, but
+                # create-design-from-candidate still requires the original id.
+                return {**payload, "job_id": job_id}
             state = str(_nested(payload, "status", "state", "job_status") or "").lower()
             if state in {"failed", "error", "cancelled", "canceled"}:
                 raise CanvaMCPError(f"Canva design generation job ended with status {state}.")

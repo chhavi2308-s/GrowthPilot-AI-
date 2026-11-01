@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     llm_effort: str = "medium"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
+    planner_fallback_model: str = ""
     gemini_thinking_level: str = "medium"  # minimal | low | medium | high (per-model support varies)
 
     # Research

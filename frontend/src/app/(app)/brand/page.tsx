@@ -16,7 +16,7 @@ type WebsiteProduct = { name: string; sku: string; category: string; description
 type WebsiteDraft = { name: string; website: string; description: string; positioning: string; location: string; audience: string;
   voice: string; tone: string; goals: string; visual_guidelines: string; colors: string[]; content_pillars: string[];
   profile_sources: { field: string; source_url: string; retrieved_at: string; note: string }[];
-  pages_scanned: { url: string; title: string }[]; products: WebsiteProduct[]; text_preview: string; needs_user_confirmation: string[] };
+  pages_scanned: { url: string; title: string }[]; products?: WebsiteProduct[]; text_preview: string; needs_user_confirmation: string[] };
 const productKey = (product: WebsiteProduct) => `${product.source_url}|${product.sku}|${product.name}`;
 
 function csvRows(text: string): string[][] {
@@ -52,8 +52,9 @@ function WebsiteSetup({ onSaved, brand }: { onSaved: () => void; brand: Brand | 
     setDraft(null); setWarnings([]); setCompletion(null);
     const r = await scan.run(() => api.post<{ draft: WebsiteDraft; warnings: string[] }>("/api/onboarding/scan-website", { website }));
     if (r) {
-      setDraft(r.draft); setWarnings(r.warnings);
-      setSelectedProducts(new Set(r.draft.products.map(productKey)));
+      const products = r.draft.products ?? [];
+      setDraft({ ...r.draft, products }); setWarnings(r.warnings);
+      setSelectedProducts(new Set(products.map(productKey)));
     }
   };
   const continueManually = () => {
@@ -84,7 +85,7 @@ function WebsiteSetup({ onSaved, brand }: { onSaved: () => void; brand: Brand | 
       image_urls: (get(cells, "image_url", "image_urls") || "").split(/[|;]/).map((x) => x.trim()).filter(Boolean),
     })).filter((p) => p.name.trim());
     if (!imported.length) { scan.setError("No product rows with a name were found in that CSV."); return; }
-    const products = [...draft.products, ...imported].slice(0, 50);
+    const products = [...(draft.products ?? []), ...imported].slice(0, 50);
     setDraft({ ...draft, products });
     setSelectedProducts(new Set(products.map(productKey)));
     scan.setError(null);
@@ -103,7 +104,7 @@ function WebsiteSetup({ onSaved, brand }: { onSaved: () => void; brand: Brand | 
       profile_sources: [...(brand?.profile_sources || []), ...draft.profile_sources],
       permitted_sources: [...new Set([...existing.permitted_sources, new URL(draft.website).hostname])],
       });
-      const chosen = draft.products.filter((p) => selectedProducts.has(productKey(p)));
+      const chosen = (draft.products ?? []).filter((p) => selectedProducts.has(productKey(p)));
       const result = chosen.length ? await api.post<{ created: number; updated: number; photos_downloaded: number; warnings: string[] }>(
         "/api/onboarding/import-products", { website: draft.website, products: chosen }) :
         { created: 0, updated: 0, photos_downloaded: 0, warnings: [] };
@@ -139,9 +140,9 @@ function WebsiteSetup({ onSaved, brand }: { onSaved: () => void; brand: Brand | 
         <div className="mt-2"><span className="mr-2 text-xs text-muted">Channels to focus on:</span><div className="inline-flex flex-wrap gap-2">{PLATFORM_ORDER.map((p) => <label key={p} className="flex cursor-pointer items-center gap-1.5 rounded-full border border-line px-2.5 py-1 text-xs"><input type="checkbox" checked={platforms.includes(p)} onChange={(e) => setPlatforms(e.target.checked ? [...platforms, p] : platforms.filter((x) => x !== p))} /><PlatformChip platform={p} withLabel /></label>)}</div></div>
       </div>
       <div className="rounded-lg border border-line p-3">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><div><p className="text-sm font-semibold">Products found</p><p className="text-xs text-muted">We use structured facts published by your site; select what should enter the catalogue.</p></div><Badge>{draft.products.length} found</Badge></div>
-        {draft.products.length === 0 ? <p className="text-sm text-muted">No structured product listings were found. Add a product CSV or continue with an empty catalogue and add products later.</p> : (
-          <div className="max-h-80 space-y-2 overflow-y-auto">{draft.products.map((p) => {
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><div><p className="text-sm font-semibold">Products found</p><p className="text-xs text-muted">We use structured facts published by your site; select what should enter the catalogue.</p></div><Badge>{(draft.products ?? []).length} found</Badge></div>
+        {(draft.products ?? []).length === 0 ? <p className="text-sm text-muted">No structured product listings were found. Add a product CSV or continue with an empty catalogue and add products later.</p> : (
+          <div className="max-h-80 space-y-2 overflow-y-auto">{(draft.products ?? []).map((p) => {
             const key = productKey(p);
             return <label key={key} className="flex cursor-pointer gap-3 rounded-lg border border-line p-2.5 hover:border-accent">
               <input type="checkbox" className="mt-1" checked={selectedProducts.has(key)} onChange={(e) => setSelectedProducts((current) => { const next = new Set(current); if (e.target.checked) next.add(key); else next.delete(key); return next; })} />

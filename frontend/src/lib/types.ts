@@ -307,7 +307,14 @@ export interface ContentItem {
     job_id?: number;
     design_id?: string;
     asset_id?: number | null;
-    mode?: "image-based" | "text-only";
+    mode?: "image-based" | "text-only" | "prompt-led" | "image-to-image";
+    phase?: string;
+    prompt?: string;
+    request_key?: string;
+    generation_job_id?: string;
+    reference_asset_id?: number | null;
+    selected_candidate_id?: string | null;
+    candidates?: { id: string; title: string; preview_asset_id: number | null; preview_url?: string }[];
     image_trust?: "uploaded" | "none" | string;
     image_skip_reason?: string | null;
     edit_link_available?: boolean;

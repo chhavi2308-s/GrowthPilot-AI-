@@ -47,6 +47,12 @@ _sleep = time.sleep
 FINISHED = (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.BLOCKED)
 
 
+def _gemini_fallback(settings, model: str):
+    from ..llm.gemini_llm import GeminiLLM
+
+    return GeminiLLM(api_key=settings.gemini_api_key, model=model, thinking_level=settings.gemini_thinking_level)
+
+
 def set_sleep(fn) -> None:
     global _sleep
     _sleep = fn
@@ -272,6 +278,7 @@ class Runner:
             r.status = RunStatus.RUNNING
             self.db.commit()
         planner_retries = 0
+        planner_fallback_attempted = False
         while True:
             stop = self._limits()
             if stop == "paused":
@@ -306,6 +313,19 @@ class Runner:
                               f"retrying (retry {planner_retries} of {PLANNER_RETRIES}). Completed work is kept.",
                               status="error")
                     _sleep(wait)
+                    continue
+                fallback_model = self.ctx.settings.planner_fallback_model.strip()
+                current_llm = getattr(self.planner, "llm", None)
+                if (exc.retryable and not planner_fallback_attempted and fallback_model and
+                        self.ctx.settings.active_llm_provider == "gemini" and current_llm is not None and
+                        fallback_model != getattr(current_llm, "model", None)):
+                    self.db.rollback()
+                    fallback = _gemini_fallback(self.ctx.settings, fallback_model)
+                    self.planner.llm = fallback
+                    self.planner.name = fallback.name
+                    planner_fallback_attempted = True
+                    self.step("decision", f"Primary planner model retries were exhausted; trying fallback model "
+                              f"{fallback.name} once.", status="error")
                     continue
                 self._finish(RunStatus.FAILED, "llm_error", f"The planner model failed: {exc}")
                 return

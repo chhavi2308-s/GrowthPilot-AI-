@@ -32,6 +32,8 @@ from ..models import (
     utcnow,
 )
 from . import assets
+from .canva_choices import _canva_image_url, image_prompt, prompt_query, request_key, save_options
+from .canva_reference import edit_reference
 
 MAX_JOB_CALLS = 3
 
@@ -55,11 +57,39 @@ def _claim_supported(claim: ClaimAllowed, product: Product | None) -> bool:
 def _schema_args(client, tool: str, values: dict[str, Any]) -> dict[str, Any]:
     schema = client.schema(tool)
     props = schema.get("properties", {})
-    args = {k: v for k, v in values.items() if k in props}
+    args = {k: v for k, v in values.items() if k in props and v is not None}
     missing = sorted(set(schema.get("required", [])) - set(args))
     if missing:
         raise CanvaMCPError(f"Unmapped required {tool} fields: {', '.join(missing)}")
     return args
+
+
+def _png_format(spec: dict[str, Any]) -> Any:
+    if spec.get("type") == "string" or "enum" in spec:
+        choices = spec.get("enum", ["png"])
+        return next((value for value in choices if isinstance(value, str) and value.casefold() == "png"), None)
+    if spec.get("type") == "object":
+        value = {key: _png_format(child) for key, child in spec.get("properties", {}).items()
+                 if key in {"type", "format", "file_type"} and isinstance(child, dict)}
+        value = {key: item for key, item in value.items() if item is not None}
+        if value and not (set(spec.get("required", [])) - set(value)):
+            return value
+    for child in spec.get("anyOf", []) + spec.get("oneOf", []):
+        value = _png_format(child)
+        if value is not None:
+            return value
+    return None
+
+
+def _export_args(client, design_id: str) -> dict[str, Any]:
+    props = client.schema("export-design").get("properties", {})
+    values: dict[str, Any] = {"design_id": design_id, "as_single_image": True,
+                              "user_intent": "Export poster PNG for review."}
+    formats = {name: _png_format(props[name]) for name in ("format", "export_format", "file_type")
+               if isinstance(props.get(name), dict)}
+    if not any(value is not None for value in formats.values()):
+        raise CanvaMCPError("Canva export schema does not advertise a supported PNG format.")
+    return _schema_args(client, "export-design", {**values, **formats})
 
 
 def _urls(value):
@@ -91,6 +121,9 @@ def _design_id(payload: dict[str, Any]) -> str | None:
     design = payload.get("design")
     if isinstance(design, dict) and isinstance(design.get("id"), str):
         return design["id"]
+    summary = payload.get("design_summary")
+    if isinstance(summary, dict) and isinstance(summary.get("id"), str):
+        return summary["id"]
     for value in payload.values():
         if isinstance(value, dict) and (found := _design_id(value)):
             return found
@@ -101,9 +134,14 @@ def _design_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _qa_verdict(brief: CreativeBrief, brand: Brand, product: Product | None, *, image_used: bool,
+def _qa_verdict(brief: CreativeBrief | None, brand: Brand, product: Product | None, *, image_used: bool,
                 image_skip_reason: str | None) -> dict[str, Any]:
     """Run deterministic text/product guards; visual checks remain pending human review."""
+    if brief is None:
+        return {"passed": False, "status": "REQUIRES_HUMAN_REVIEW",
+                "issues": ["Review the AI-generated design against your Image brief before approving.",
+                           "On-image text, brand, factual claims and visual content require human verification."],
+                "checks": {"visual_review": "pending", "claims_supported_by_product_data": "not_verified"}}
     unsupported = [claim.text for claim in brief.claims_allowed if not _claim_supported(claim, product)]
     copy = " ".join([brief.headline, brief.tagline, brief.cta]).casefold()
     religious = any(word in copy for word in ("mantra", "sanskrit", "ॐ", "swastika", "deity"))
@@ -145,8 +183,11 @@ def _persist_poster(db, item: ContentItem, job: CanvaPosterJob, brand: Brand, pn
                             note="Attached exported Canva poster for human review.")
     content_workflow._clear_approval(item)
     item.status = ContentStatus.IN_REVIEW
-    item.canva_poster = {"job_id": job.id, "design_id": design_id, "asset_id": asset.id,
-                         "mode": "image-based" if image_trust == "uploaded" else "text-only",
+    choice = {key: value for key, value in (item.canva_poster or {}).items()
+              if key in {"request_key", "prompt", "candidates", "generation_job_id", "selected_candidate_id",
+                         "reference_asset_id"}}
+    item.canva_poster = {**choice, "phase": "completed", "job_id": job.id, "design_id": design_id, "asset_id": asset.id,
+                         "mode": (item.canva_poster or {}).get("mode", "image-based" if image_trust == "uploaded" else "text-only"),
                          "image_trust": image_trust, "image_skip_reason": image_skip_reason, "qa": qa,
                          "edit_link_available": edit_link_available}
     job.status = "completed"
@@ -242,6 +283,17 @@ def validate_brief_for_item(db, item: ContentItem, brand: Brand) -> tuple[Creati
     return brief, to_canva_handoff(brief)
 
 
+def prepare_canva_brief(db, item: ContentItem, brand: Brand) -> tuple[CreativeBrief | None, dict[str, Any]]:
+    if item.workspace_id != brand.workspace_id:
+        raise CanvaMCPError("Brand is unavailable in this workspace.")
+    prompt = image_prompt(item)
+    if prompt:
+        return None, {"canva_query": prompt_query(prompt, brand)}
+    if not getattr(item, "creative_brief", None):
+        raise CanvaMCPError("Enter an Image brief to describe the images you want, then generate options.")
+    return validate_brief_for_item(db, item, brand)
+
+
 async def _upload_trusted_images(client, db, workspace_id: int, brand: Brand, brief: CreativeBrief) -> list[str]:
     ids = []
     for ref in to_canva_handoff(brief).get("image_refs", []):
@@ -268,13 +320,25 @@ async def _upload_asset(client, asset: Asset, user_intent: str) -> str:
         raise CanvaMCPError("Canva upload schema has required fields GrowthPilot cannot safely map.")
     result = await client.call("create-upload-url", args)
     upload_url = _nested(result, "upload_url", "uploadUrl")
-    media_id = _nested(result, "asset_id", "media_id", "assetId")
-    if not isinstance(upload_url, str) or not upload_url.startswith("https://") or not isinstance(media_id, str):
-        raise CanvaMCPError("Canva upload response omitted a safe URL or asset id.")
-    async with httpx.AsyncClient(timeout=60, follow_redirects=False) as http:
-        response = await http.put(upload_url, content=data, headers={"Content-Type": asset.content_type})
+    media_id = _nested(result, "asset_id", "media_id", "assetId", "mediaId")
+    method = result.get("httpMethod", "POST")
+    if not isinstance(upload_url, str) or not _canva_image_url(upload_url) or method not in {"POST", "PUT"}:
+        raise CanvaMCPError("Canva upload response omitted a supported single-use upload URL or method.")
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as http:
+            response = await http.request(method, upload_url, content=data,
+                headers={"Content-Type": "application/octet-stream" if method == "POST" else asset.content_type})
+    except httpx.HTTPError:
+        raise CanvaMCPError("Canva reference image upload failed; no upload URL was reused.") from None
     if response.status_code >= 300:
         raise CanvaMCPError(f"Canva image upload failed with HTTP {response.status_code}.")
+    if not media_id:
+        try:
+            media_id = _nested(response.json(), "mediaId", "media_id", "assetId", "asset_id")
+        except ValueError:
+            media_id = None
+    if not isinstance(media_id, str) or not media_id:
+        raise CanvaMCPError("Canva upload completed without a media id.")
     return media_id
 
 
@@ -324,71 +388,130 @@ async def process_job(db, job: CanvaPosterJob, *, rest_exporter=rest_export) -> 
     brand = db.get(Brand, item.brand_id)
     if brand is None or brand.workspace_id != job.workspace_id:
         raise CanvaMCPError("Brand is unavailable in this workspace.")
-    brief, handoff = validate_brief_for_item(db, item, brand)
+    brief, handoff = prepare_canva_brief(db, item, brand)
     product = None
     if item.product_ids:
         product = db.execute(select(Product).where(Product.id.in_(item.product_ids),
             Product.workspace_id == job.workspace_id, Product.brand_id == brand.id)).scalars().first()
-    if job.calls_used >= MAX_JOB_CALLS:
+    saved = item.canva_poster if isinstance(item.canva_poster, dict) else {}
+    snapshot = request_key(item) if saved.get("request_key") else None
+    if snapshot and saved["request_key"] != snapshot:
+        raise CanvaMCPError("The Image brief changed. Generate new options before choosing a design.")
+    selected = saved.get("selected_candidate_id")
+    design_id = saved.get("design_id") if saved.get("job_id") == job.id else None
+    design_id = design_id if isinstance(design_id, str) and design_id else None
+    image_trust = saved.get("image_trust", "none")
+    image_skip_reason = saved.get("image_skip_reason")
+    edit_link_available = bool(saved.get("edit_link_available"))
+    if not design_id and not selected and job.calls_used >= MAX_JOB_CALLS:
         raise CanvaMCPError("Per-job generation call cap reached.")
     settings = get_settings()
     async with connected_workspace_client(db, job.workspace_id, settings) as (client, _credential):
-        if not {"generate-design", "create-design-from-candidate"}.issubset(client.tools):
-            raise CanvaMCPError("Authenticated Canva MCP is missing required allow-listed tools.")
-        cap = getattr(settings, "canva_mcp_daily_cap", 10)
-        generate_schema = client.schema("generate-design")
-        can_attach_assets = "asset_ids" in generate_schema.get("properties", {})
-        if brief.image_policy == "must_use_images" and not can_attach_assets:
-            raise CanvaMCPError("Canva generate-design schema cannot accept the required verified image asset.")
-        uploaded_ids = await _upload_trusted_images(client, db, job.workspace_id, brand, brief) \
-            if brief.image_policy != "text_only" and can_attach_assets and "create-upload-url" in client.tools else []
-        logo_id = await _upload_brand_logo(client, db, job.workspace_id, brand) if can_attach_assets else None
-        image_trust = "uploaded" if uploaded_ids else "none"
-        if brief.image_policy == "must_use_images" and not uploaded_ids:
-            raise CanvaMCPError("Required image policy has no verified real-match or uploaded image available.")
-        image_skip_reason = None
-        if brief.image_policy != "text_only" and not uploaded_ids:
-            image_skip_reason = ("The generate-design schema cannot attach product images." if not can_attach_assets
-                                 else "No verified product image was attachable; poster was generated text-only.")
-        q = handoff.get("canva_query")
-        if not q:
-            raise CanvaMCPError("CreativeBrief has no Canva query.")
-        query = _brand_prompt(q, brand, logo_id is not None, brief, image_skip_reason)
-        all_asset_ids = [*uploaded_ids, *([logo_id] if logo_id else [])]
-        args = generate_design_args(client.tools["generate-design"], query=query,
-            user_intent=f"Create a private {brief.format} draft for human review.", asset_ids=all_asset_ids or None)
-        job.calls_used += 1
-        reserve_daily_generation(db, limit=cap, now=utcnow())
-        db.commit()
-        generated = await client.call("generate-design", args, reservation_made=True)
-        db.flush()
-        generated = await client.poll_design_job(generated)
-        candidates = _candidate_rows(generated)
-        if not candidates:
-            raise CanvaMCPError("Canva returned no design candidates.")
-        candidate = _select_candidate(candidates)
-        candidate_id = _nested(candidate, "candidate_id", "id")
-        if not candidate_id:
-            raise CanvaMCPError("Canva candidate omitted its id.")
-        committed = await client.call("create-design-from-candidate", _schema_args(client,
-            "create-design-from-candidate", {"candidate_id": candidate_id,
-            "job_id": _nested(generated, "job_id", "jobId"),
-            "user_intent": f"Commit private {brief.format} poster for review."}))
-        design_id = _design_id(committed)
-        if not isinstance(design_id, str):
-            raise CanvaMCPError("Canva commit returned no design id.")
+        if not design_id and not selected:
+            if not {"generate-design", "create-design-from-candidate"}.issubset(client.tools):
+                raise CanvaMCPError("Authenticated Canva MCP is missing required allow-listed tools.")
+            cap = getattr(settings, "canva_mcp_daily_cap", 10)
+            generate_schema = client.schema("generate-design")
+            can_attach_assets = "asset_ids" in generate_schema.get("properties", {})
+            if brief and brief.image_policy == "must_use_images" and not can_attach_assets:
+                raise CanvaMCPError("Canva generate-design schema cannot accept the required verified image asset.")
+            uploaded_ids = await _upload_trusted_images(client, db, job.workspace_id, brand, brief) \
+                if brief and brief.image_policy != "text_only" and can_attach_assets and "create-upload-url" in client.tools else []
+            reference_id = saved.get("reference_asset_id")
+            if reference_id:
+                reference = db.get(Asset, reference_id)
+                if (not reference or reference.workspace_id != job.workspace_id or
+                        reference.brand_id not in (None, brand.id) or reference.content_type not in {"image/png", "image/jpeg"}):
+                    raise CanvaMCPError("The reference image is unavailable in this workspace.")
+                if not can_attach_assets or not {"create-upload-url", "generate-image", "get-generate-image-job"}.issubset(client.tools):
+                    raise CanvaMCPError("This Canva connection cannot use reference images; the reference was not ignored.")
+                edited_media = saved.get("edited_media_id")
+                if not edited_media:
+                    reference_media = saved.get("reference_media_id") or await _upload_asset(
+                        client, reference, "Upload the user-selected reference image for a private AI variation.")
+                    item.canva_poster = {**item.canva_poster, "reference_media_id": reference_media}
+                    db.commit()
+                    job.calls_used += 1
+                    reserve_daily_generation(db, limit=cap, now=utcnow(), operation="generate-image")
+                    db.commit()
+                    edited_media = await edit_reference(client, reference_media, image_prompt(item))
+                    item.canva_poster = {**item.canva_poster, "edited_media_id": edited_media}
+                    db.commit()
+                uploaded_ids = [edited_media]
+            logo_id = await _upload_brand_logo(client, db, job.workspace_id, brand) if brief and can_attach_assets else None
+            image_trust = "reference" if reference_id else "uploaded" if uploaded_ids else "none"
+            if brief and brief.image_policy == "must_use_images" and not uploaded_ids:
+                raise CanvaMCPError("Required image policy has no verified real-match or uploaded image available.")
+            image_skip_reason = None
+            if brief and brief.image_policy != "text_only" and not uploaded_ids:
+                image_skip_reason = ("The generate-design schema cannot attach product images." if not can_attach_assets
+                                     else "No verified product image was attachable; poster was generated text-only.")
+            q = handoff.get("canva_query")
+            if not q:
+                raise CanvaMCPError("CreativeBrief has no Canva query.")
+            query = _brand_prompt(q, brand, logo_id is not None, brief, image_skip_reason) if brief else q
+            if reference_id:
+                query += " Use the supplied edited reference image as the main visual; preserve its identity when creating the layout options."
+            max_query = generate_schema.get("properties", {}).get("query", {}).get("maxLength")
+            if isinstance(max_query, int) and len(query) > max_query:
+                raise CanvaMCPError("This Image brief exceeds Canva's prompt limit. Shorten it and try again.")
+            all_asset_ids = [*uploaded_ids, *([logo_id] if logo_id else [])]
+            args = generate_design_args(client.tools["generate-design"], query=query,
+                user_intent="Generate different private design options for the user to choose from.",
+                asset_ids=all_asset_ids or None)
+            if job.calls_used >= MAX_JOB_CALLS:
+                raise CanvaMCPError("This batch reached its retry limit. Generate new options to start a fresh batch.")
+            job.calls_used += 1
+            reserve_daily_generation(db, limit=cap, now=utcnow())
+            db.commit()
+            generated = await client.call("generate-design", args, reservation_made=True)
+            db.flush()
+            generated = await client.poll_design_job(generated)
+            candidates = _candidate_rows(generated)
+            if not candidates:
+                raise CanvaMCPError("Canva returned no design candidates.")
+            generation_id = _nested(generated, "job_id", "jobId")
+            if not generation_id and isinstance(generated.get("job"), dict):
+                generation_id = generated["job"].get("id")
+            if not isinstance(generation_id, str) or not generation_id:
+                raise CanvaMCPError("Canva omitted the generation job id required to select a design.")
+            options = await save_options(db, job, brand, candidates)
+            if snapshot:
+                db.refresh(item)
+                if request_key(item) != snapshot:
+                    raise CanvaMCPError("The Image brief changed while generating. Generate new options.")
+            item.canva_poster = {"job_id": job.id, "phase": "awaiting_selection",
+                "request_key": snapshot or request_key(item), "prompt": image_prompt(item),
+                "generation_job_id": generation_id, "candidates": options, "selected_candidate_id": None,
+                "mode": "image-to-image" if reference_id else "prompt-led" if brief is None else "image-based" if uploaded_ids else "text-only",
+                "reference_asset_id": reference_id,
+                "image_trust": image_trust, "image_skip_reason": image_skip_reason}
+            job.status, job.error = "awaiting_selection", ""
+            db.commit()
+            return
+        if not design_id:
+            if not selected or selected not in {row.get("id") for row in saved.get("candidates", [])}:
+                raise CanvaMCPError("Choose one of the generated options before creating the design.")
+            committed = await client.call("create-design-from-candidate", _schema_args(client,
+                "create-design-from-candidate", {"candidate_id": selected,
+                "job_id": saved.get("generation_job_id"),
+                "user_intent": "Create the exact design option selected by the user for review."}))
+            design_id = _design_id(committed)
+            if not isinstance(design_id, str):
+                raise CanvaMCPError("Canva commit returned no design id.")
+            edit_link_available = bool(_nested(committed, "edit_url", "editUrl"))
+            item.canva_poster = {**saved, "phase": "exporting", "job_id": job.id, "design_id": design_id, "asset_id": None,
+                                 "mode": saved.get("mode", "text-only"),
+                                 "image_trust": image_trust, "image_skip_reason": image_skip_reason,
+                                 "edit_link_available": edit_link_available}
+            db.commit()
         job.status = "exporting"
-        item.canva_poster = {"job_id": job.id, "design_id": design_id, "asset_id": None,
-                             "mode": "image-based" if uploaded_ids else "text-only",
-                             "image_trust": image_trust, "image_skip_reason": None,
-                             "edit_link_available": bool(_nested(committed, "edit_url", "editUrl"))}
         db.commit()
         png = None
+        export_error = None
         if "export-design" in client.tools:
             try:
-                exported = await client.call("export-design", _schema_args(client, "export-design", {
-                    "design_id": design_id, "format": "png", "export_format": "png", "as_single_image": True,
-                    "user_intent": "Export poster PNG for review."}))
+                exported = await client.call("export-design", _export_args(client, design_id))
                 for url in _urls(exported):
                     if urlparse(url).scheme != "https":
                         continue
@@ -400,11 +523,17 @@ async def process_job(db, job: CanvaPosterJob, *, rest_exporter=rest_export) -> 
                     if r.status_code == 200 and r.content.startswith(b"\x89PNG\r\n\x1a\n"):
                         png = r.content
                         break
-            except CanvaMCPError:
+            except CanvaMCPError as exc:
                 # REST export is the only fallback when MCP export is absent or unusable.
+                export_error = safe_canva_message(str(exc))
                 png = None
         if png is None:
-            png = await rest_exporter(db, job.workspace_id, design_id)
+            try:
+                png = await rest_exporter(db, job.workspace_id, design_id)
+            except CanvaMCPError:
+                if export_error:
+                    raise CanvaMCPError(f"Canva MCP export failed: {export_error}; REST fallback unavailable.") from None
+                raise
     if len(png) > assets.MAX_UPLOAD_BYTES:
         raise CanvaMCPError("Exported poster exceeds the supported 8 MB asset limit.")
     png = _overlay_brand_mark(png, brand.name, _brand_logo_bytes(db, brand, job.workspace_id))
@@ -412,11 +541,16 @@ async def process_job(db, job: CanvaPosterJob, *, rest_exporter=rest_export) -> 
         raise CanvaMCPError("Branded poster exceeds the supported 8 MB asset limit.")
     qa = _qa_verdict(brief, brand, product, image_used=image_trust == "uploaded",
                      image_skip_reason=image_skip_reason)
+    if snapshot:
+        db.refresh(item)
+        if (request_key(item) != snapshot or item.status in
+                {ContentStatus.PUBLISHED, ContentStatus.PUBLISHING, ContentStatus.CANCELLED}):
+            raise CanvaMCPError("The post changed while exporting. Refresh it before generating a new design.")
     job.status = "qa"
     db.commit()
     _persist_poster(db, item, job, brand, png, design_id, qa,
                     image_trust=image_trust, image_skip_reason=image_skip_reason,
-                    edit_link_available=bool(_nested(committed, "edit_url", "editUrl")))
+                    edit_link_available=edit_link_available)
 
 
 def process_queued(db, *, limit=1):
