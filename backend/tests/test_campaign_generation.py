@@ -209,7 +209,7 @@ def test_full_live_campaign_with_sources_strategy_captions_and_2k_images(monkeyp
     assert len(fake.gemini) == 5
     for body, headers in zip(fake.gemini, fake.gemini_headers, strict=True):
         assert body["model"] == "gemini-nano-banana-2.1" and body["store"] is False
-        assert body["response_format"] == {"type": "image", "mime_type": "image/png", "aspect_ratio": "4:5",
+        assert body["response_format"] == {"type": "image", "mime_type": "image/jpeg", "aspect_ratio": "4:5",
                                            "image_size": "2K"}
         assert headers["x-goog-api-key"] == "gem-test"
     with session_scope() as db:
@@ -552,3 +552,18 @@ def test_a_busy_image_slot_waits_instead_of_spinning(monkeypatch, tmp_path):
         row.status, row.claimed_at = "generating", utcnow()
     assert drain() == 1 and fake.gemini == []  # one check, then it waits for the next tick
     assert gen_of(api, gid)["status"] == "queued"
+
+
+def test_campaign_image_error_keeps_reason_without_credentials_or_urls():
+    from growthpilot.creative import imagegen
+
+    class SDKError(Exception):
+        code = 400
+
+    key = "dummy-credential-for-redaction-test"
+    exc = SDKError(f"mime_type must be image/jpeg; api_key={key}; https://example.test/image?signature=private")
+    result = imagegen._classify(exc, key)
+    assert "mime_type must be image/jpeg" in str(result)
+    assert key not in str(result)
+    assert "https://" not in str(result)
+    assert "signature=private" not in str(result)

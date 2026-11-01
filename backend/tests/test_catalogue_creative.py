@@ -252,3 +252,12 @@ def test_experiment_is_evaluated_within_one_platform(poojaloka_seeded):
     assert e["confidence"] in ("low", "medium", "high")
     assert "permutation test" in e["comparison_method"]
     run_worker()
+
+
+def test_renderer_omits_unsupported_emoji_without_drawing_missing_glyph_boxes():
+    result = render(CreativeInput(template="festive", width=1080, height=1350,
+                                  headline="Light up Deepavali \U0001fa94\ufe0f"))
+    headline = next(layer for layer in result.layers if layer.kind == "headline")
+    assert headline.text == "Light up Deepavali"
+    assert any(check["code"] == "unsupported_emoji" and check["status"] == "warn" for check in result.checks)
+    assert not any(check["code"] == "glyphs" and check["status"] == "fail" for check in result.checks)

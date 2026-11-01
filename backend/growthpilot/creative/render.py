@@ -357,6 +357,11 @@ def render(inp: CreativeInput) -> RenderResult:
         cx = (m + (m + text_w)) // 2 if side_photo else W // 2
         if band_h >= int(140 * unit):
             if inp.template in ("festive", "promo_poster", "launch"):
+                if inp.template == "festive" and band_h >= int(360 * unit):
+                    # Fill a tall empty band without placing decoration underneath the copy.
+                    radius = int(min(band_h * 0.36, text_w * 0.28))
+                    draw_rangoli(d, cx, band_top + band_h // 2, radius,
+                                 _mix(col["bg"], col["accent"], 0.36))
                 s = int(min(band_h * 0.22, 60 * unit))
                 n = 3 if (text_w < W * 0.6) else 5
                 gap = min(text_w // n, int(s * 4.2))
@@ -503,6 +508,16 @@ def _text(draw, record: bool, kind: str, text: str, name: str, start: int, minim
     """Draw wrapped, auto-fitted text; returns the y below it. Records a layer and any checks when ``record``."""
     if not text.strip():
         return y
+    # Unsupported decorative emoji otherwise render as the font's tall "NO GLYPH" box.
+    missing = missing_glyphs(font(name, max(1, int(start * unit))), text)
+    emoji = {ch for ch in missing if 0x1F000 <= ord(ch) <= 0x1FAFF or 0x2600 <= ord(ch) <= 0x27BF}
+    if emoji:
+        text = " ".join(text.translate({ord(ch): None for ch in emoji | {"\ufe0f", "\u200d"}}).split())
+        if record:
+            checks.append({"code": "unsupported_emoji", "status": "warn",
+                           "message": f"Unsupported decorative emoji omitted from the {kind}; captions are unchanged."})
+        if not text:
+            return y
     f, lines, fits = fit_text(draw, text, name, width, max_lines, int(start * unit), int(minimum * unit))
     if record:
         miss = missing_glyphs(f, text)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 import threading
 
 import httpx
@@ -16,6 +17,7 @@ import httpx
 from .. import usage
 from ..config import get_settings
 from ..research.net import client
+from ..security import redact
 
 API = "https://generativelanguage.googleapis.com/v1beta/interactions"
 RATIOS = {(4, 5): "4:5", (1, 1): "1:1", (2, 3): "2:3", (16, 9): "16:9", (9, 16): "9:16", (3, 4): "3:4"}
@@ -169,7 +171,7 @@ def generate_image(prompt: str, *, aspect_ratio: str, size: str, model: str,
     price = image_price(model, size)
     usage.preflight(price, f"A {size} campaign image")
     body = {"model": model, "store": False, "input": [{"type": "text", "text": prompt}],
-            "response_format": {"type": "image", "mime_type": "image/png", "aspect_ratio": aspect_ratio,
+            "response_format": {"type": "image", "mime_type": "image/jpeg", "aspect_ratio": aspect_ratio,
                                 "image_size": size}}
     with _limiter():
         try:
@@ -208,5 +210,6 @@ def _classify(exc: Exception, key: str) -> ImageGenError:
         return ImageGenError(f"Image provider error (HTTP {code}).", retryable=True)
     if isinstance(code, int) and code >= 400:
         detail = "safety" if "safety" in text.lower() or "block" in text.lower() else f"HTTP {code}"
-        return ImageGenError(f"The image provider refused the request ({detail}).")
+        reason = re.sub(r'https?://[^\s"<>]+', "[URL REDACTED]", redact(text))[:500]
+        return ImageGenError(f"The image provider refused the request ({detail}). {reason}")
     return ImageGenError(f"Image request failed ({name}).", retryable=True)
